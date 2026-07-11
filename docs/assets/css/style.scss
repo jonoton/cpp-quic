@@ -1,0 +1,110 @@
+---
+---
+@import "{{ site.theme }}";
+
+/* Custom modern aesthetics — Deep Teal / Electric Cyan palette */
+$header-bg-color: #0d4f4f; /* Deep Teal */
+$header-bg-color-secondary: #2dd4bf; /* Electric Teal */
+
+.page-header {
+  background-color: $header-bg-color;
+  background-image: linear-gradient(135deg, $header-bg-color, $header-bg-color-secondary);
+  color: #ffffff;
+  padding: 5rem 2rem;
+  text-align: center;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+  border-bottom: 4px solid #99f6e4;
+}
+
+.project-name {
+  font-size: 3.5rem;
+  font-weight: 800;
+  letter-spacing: -0.05em;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+  color: #ffffff;
+  border-bottom: none;
+}
+
+.project-name a {
+  color: #ffffff !important;
+  text-decoration: none !important;
+}
+
+.project-name a:hover {
+  text-decoration: underline !important;
+}
+
+.project-tagline {
+  font-size: 1.25rem;
+  opacity: 0.9;
+  font-weight: 300;
+  color: #ccfbf1;
+}
+
+.btn {
+  display: inline-block;
+  margin-bottom: 0.5rem;
+  color: rgba(255, 255, 255, 0.85);
+  background-color: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.3);
+  border-style: solid;
+  border-width: 1px;
+  border-radius: 0.5rem;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s;
+  padding: 0.75rem 1.5rem;
+  font-weight: 500;
+}
+
+.btn:hover {
+  color: rgba(255, 255, 255, 1);
+  background-color: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.4);
+  text-decoration: none;
+}
+
+.main-content h1,
+.main-content h2,
+.main-content h3,
+.main-content h4,
+.main-content h5,
+.main-content h6 {
+  color: #0d4f4f;
+}
+
+.main-content a {
+  color: #0f766e;
+}
+
+.main-content a:hover {
+  color: #14b8a6;
+}
+
+code {
+  padding: 2px 4px;
+  font-family: Consolas, "Liberation Mono", Menlo, Courier, monospace;
+  color: #0f766e;
+  background-color: #f0fdfa;
+  border-radius: 0.3rem;
+}
+
+pre {
+  padding: 0.8rem;
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font: 1rem Consolas, "Liberation Mono", Menlo, Courier, monospace;
+  color: #f8f8f2;
+  word-wrap: normal;
+  background-color: #0a2e2e;
+  border: solid 1px #0d4f4f;
+  border-radius: 0.5rem;
+  box-shadow: 0 2px 4px rgba(13, 79, 79, 0.1);
+}
+
+pre code {
+  color: #ccfbf1;
+  background-color: transparent;
+}
+
+.site-footer {
+  border-top: 2px solid #99f6e4;
+}
