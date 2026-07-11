@@ -219,6 +219,42 @@ TEST(QuicPacketTest, SerializeDeserializeStreamFrame) {
   EXPECT_EQ(frame.data, sf.data);
 }
 
+TEST(QuicPacketTest, SerializeDeserializeEncrypted) {
+  cppquic::QuicPacket pkt;
+  pkt.connection_id = cppquic::internal::GenerateConnectionId();
+  pkt.packet_number = 1;
+
+  cppquic::StreamFrame sf;
+  sf.stream_id = 4;
+  sf.offset = 0;
+  sf.fin = false;
+  sf.data = {0x48, 0x65, 0x6C, 0x6C, 0x6F};  // "Hello"
+  pkt.frames.push_back(sf);
+
+  std::vector<uint8_t> dummy_key(16, 0x11);
+  std::vector<uint8_t> dummy_iv(12, 0x22);
+
+  // Serialize with encryption
+  auto bytes = pkt.Serialize(&dummy_key, &dummy_iv);
+  EXPECT_GT(bytes.size(), 0u);
+  EXPECT_EQ(bytes[0], 0x43);  // Short Header type byte
+
+  cppquic::QuicPacket decoded;
+  // Should fail to decode without keys
+  EXPECT_FALSE(cppquic::QuicPacket::Deserialize(bytes, decoded));
+
+  // Should succeed with correct keys
+  EXPECT_TRUE(
+      cppquic::QuicPacket::Deserialize(bytes, decoded, &dummy_key, &dummy_iv));
+  EXPECT_EQ(decoded.frames.size(), 1u);
+
+  auto& frame = std::get<cppquic::StreamFrame>(decoded.frames[0]);
+  EXPECT_EQ(frame.stream_id, 4u);
+  EXPECT_EQ(frame.offset, 0u);
+  EXPECT_FALSE(frame.fin);
+  EXPECT_EQ(frame.data, sf.data);
+}
+
 TEST(QuicPacketTest, SerializeDeserializeAckFrame) {
   cppquic::QuicPacket pkt;
   pkt.connection_id = cppquic::internal::GenerateConnectionId();
@@ -241,25 +277,30 @@ TEST(QuicPacketTest, SerializeDeserializeAckFrame) {
   EXPECT_EQ(frame.acknowledged_packets.size(), 4u);
 }
 
-TEST(QuicPacketTest, SerializeDeserializeHandshake) {
+TEST(QuicPacketTest, SerializeDeserializeCrypto) {
   cppquic::QuicPacket pkt;
+  pkt.packet_type = 1;
   pkt.connection_id = cppquic::internal::GenerateConnectionId();
+  pkt.source_connection_id = cppquic::internal::GenerateConnectionId();
   pkt.packet_number = 0;
 
-  cppquic::HandshakeFrame hs;
-  hs.type = cppquic::HandshakeFrame::Type::ClientHello;
-  hs.source_connection_id = cppquic::internal::GenerateConnectionId();
-  hs.destination_connection_id = cppquic::ConnectionId{};
-  pkt.frames.push_back(hs);
+  cppquic::CryptoFrame cf;
+  cf.offset = 0;
+  cf.data = {1, 2, 3, 4};
+  pkt.frames.push_back(cf);
 
   auto bytes = pkt.Serialize();
 
   cppquic::QuicPacket decoded;
   EXPECT_TRUE(cppquic::QuicPacket::Deserialize(bytes, decoded));
 
-  auto& frame = std::get<cppquic::HandshakeFrame>(decoded.frames[0]);
-  EXPECT_EQ(frame.type, cppquic::HandshakeFrame::Type::ClientHello);
-  EXPECT_EQ(frame.source_connection_id, hs.source_connection_id);
+  EXPECT_EQ(decoded.packet_type, 1);
+  EXPECT_EQ(decoded.connection_id, pkt.connection_id);
+  EXPECT_EQ(decoded.source_connection_id, pkt.source_connection_id);
+
+  auto& frame = std::get<cppquic::CryptoFrame>(decoded.frames[0]);
+  EXPECT_EQ(frame.offset, 0u);
+  EXPECT_EQ(frame.data, cf.data);
 }
 
 TEST(QuicPacketTest, SerializeDeserializePing) {
@@ -611,10 +652,10 @@ TEST(QuicConnectionTest, HandshakePacket) {
   cppquic::QuicConnection conn(local_id, remote_id, peer, false);
   auto pkt = conn.CreateHandshakePacket();
 
+  EXPECT_EQ(pkt.packet_type, 1);
   EXPECT_EQ(pkt.frames.size(), 1u);
-  auto& hs = std::get<cppquic::HandshakeFrame>(pkt.frames[0]);
-  EXPECT_EQ(hs.type, cppquic::HandshakeFrame::Type::ClientHello);
-  EXPECT_EQ(hs.source_connection_id, local_id);
+  auto& cf = std::get<cppquic::CryptoFrame>(pkt.frames[0]);
+  EXPECT_EQ(cf.offset, 0u);
 }
 
 TEST(QuicConnectionTest, ClosePacket) {
@@ -760,11 +801,22 @@ TEST(QuicClientTest, ConnectionStateBeforeConnect) {
   EXPECT_EQ(client.GetConnectionState(), cppquic::ConnectionState::Closed);
 }
 
+TEST(QuicClientTest, AllowSelfSignedCertificates) {
+  cppquic::QuicClient client;
+  EXPECT_NO_THROW(client.SetAllowSelfSigned(true));
+  EXPECT_NO_THROW(client.SetAllowSelfSigned(false));
+}
+
 // ============================================================================
 // Integration Tests
 // ============================================================================
 
 TEST(IntegrationTest, ClientServerHandshake) {
+  cppquic::SetLogger([](cppquic::LogSeverity severity,
+                        const std::string& className,
+                        const std::string& message) {
+    std::cout << "[" << className << "] " << message << std::endl;
+  });
   cppquic::QuicServer server(0);
   server.Start();
   uint16_t port = server.GetLocalPort();
@@ -967,3 +1019,125 @@ TEST(ThroughputTrackerTest, MeasureThroughput) {
   server.Stop();
 }
 
+// ============================================================================
+// Congestion Control Tests
+// ============================================================================
+
+TEST(CongestionControllerTest, NewReno) {
+  auto controller = cppquic::CreateCongestionController(
+      cppquic::CongestionControlAlgorithm::NewReno, 1200);
+  EXPECT_EQ(controller->GetName(), "NewReno");
+  EXPECT_EQ(controller->GetCongestionWindow(), 12000);
+  EXPECT_EQ(controller->GetBytesInFlight(), 0);
+  EXPECT_TRUE(controller->CanSend(1200));
+
+  // Send packet
+  controller->OnPacketSent(1, 1200);
+  EXPECT_EQ(controller->GetBytesInFlight(), 1200);
+
+  // Ack packet in slow start
+  auto now = std::chrono::steady_clock::now();
+  controller->OnPacketAcked(1, 1200, now - std::chrono::milliseconds(100), now);
+  EXPECT_EQ(controller->GetBytesInFlight(), 0);
+  EXPECT_EQ(controller->GetCongestionWindow(), 13200);  // cwnd += 1200
+
+  // Send packets and lose one
+  controller->OnPacketSent(2, 1200);
+  controller->OnPacketSent(3, 1200);
+  EXPECT_EQ(controller->GetBytesInFlight(), 2400);
+
+  std::vector<cppquic::LostPacketInfo> lost;
+  lost.push_back({2, 1200, now - std::chrono::milliseconds(50)});
+  controller->OnPacketsLost(lost, now);
+
+  // Expect recovery: ssthresh = cwnd / 2 = 13200 / 2 = 6600, cwnd = ssthresh =
+  // 6600
+  EXPECT_EQ(controller->GetCongestionWindow(), 6600);
+  EXPECT_EQ(controller->GetBytesInFlight(), 1200);  // packet 3 remains
+
+  // Ack packet 3 (sent before loss time) -> in recovery, should not grow cwnd
+  controller->OnPacketAcked(3, 1200, now - std::chrono::milliseconds(40), now);
+  EXPECT_EQ(controller->GetCongestionWindow(), 6600);
+  EXPECT_EQ(controller->GetBytesInFlight(), 0);
+
+  // Send new packet after recovery start
+  auto post_recovery_send = std::chrono::steady_clock::now();
+  controller->OnPacketSent(4, 1200);
+
+  // Ack new packet -> outside recovery, cwnd should grow
+  controller->OnPacketAcked(4, 1200, post_recovery_send,
+                            std::chrono::steady_clock::now());
+  EXPECT_GT(controller->GetCongestionWindow(), 6600);
+}
+
+TEST(CongestionControllerTest, Cubic) {
+  auto controller = cppquic::CreateCongestionController(
+      cppquic::CongestionControlAlgorithm::Cubic, 1200);
+  EXPECT_EQ(controller->GetName(), "Cubic");
+  EXPECT_EQ(controller->GetCongestionWindow(), 12000);
+  EXPECT_EQ(controller->GetBytesInFlight(), 0);
+
+  // Send and Ack to verify slow start growth
+  controller->OnPacketSent(1, 1200);
+  auto now = std::chrono::steady_clock::now();
+  controller->OnPacketAcked(1, 1200, now - std::chrono::milliseconds(10), now);
+  EXPECT_EQ(controller->GetCongestionWindow(), 13200);
+
+  // Trigger loss
+  std::vector<cppquic::LostPacketInfo> lost;
+  lost.push_back({2, 1200, now});
+  controller->OnPacketsLost(lost, now);
+
+  // Expect recovery window reduction (beta = 0.7)
+  // W_max = 13200, cwnd = W_max * 0.7 = 9240
+  EXPECT_EQ(controller->GetCongestionWindow(), 9240);
+}
+
+TEST(CongestionControllerTest, ConstantWindow) {
+  auto controller = cppquic::CreateCongestionController(
+      cppquic::CongestionControlAlgorithm::ConstantWindow, 1200);
+  EXPECT_EQ(controller->GetName(), "ConstantWindow");
+  EXPECT_EQ(controller->GetCongestionWindow(), 1200000);
+
+  controller->OnPacketSent(1, 1200);
+  EXPECT_EQ(controller->GetBytesInFlight(), 1200);
+  EXPECT_TRUE(controller->CanSend(1000000));
+}
+
+TEST(IntegrationTest, MultipleCongestionControllers) {
+  for (auto cc_algo : {cppquic::CongestionControlAlgorithm::Cubic,
+                       cppquic::CongestionControlAlgorithm::ConstantWindow}) {
+    cppquic::QuicServer server(0);
+    server.SetCongestionControlAlgorithm(cc_algo);
+    server.SetStreamDataHandler(
+        [&server](std::shared_ptr<cppquic::QuicConnection> conn,
+                  uint64_t stream_id, const std::vector<uint8_t>& data,
+                  bool fin) {
+          server.SendOnStream(conn, stream_id, data, fin);
+        });
+
+    server.Start();
+    uint16_t port = server.GetLocalPort();
+
+    cppquic::QuicClient client;
+    client.SetCongestionControlAlgorithm(cc_algo);
+    std::atomic<int> msg_count{0};
+    client.SetStreamDataHandler([&msg_count](uint64_t,
+                                             const std::vector<uint8_t>&,
+                                             bool) { msg_count.fetch_add(1); });
+
+    client.Start();
+    ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+    uint64_t stream_id = client.OpenStream(true);
+    client.SendOnStream(stream_id, "Testing congestion control!");
+
+    EXPECT_TRUE(WaitFor([&]() { return msg_count.load() >= 1; },
+                        std::chrono::seconds(5)));
+    EXPECT_GE(msg_count.load(), 1);
+
+    client.Disconnect();
+    client.Stop();
+    server.Stop();
+  }
+}

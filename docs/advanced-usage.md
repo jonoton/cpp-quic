@@ -115,6 +115,43 @@ QUIC connections are established via a 1-RTT handshake:
 bool ok = client.Connect("server.example.com", 4433, 10000);
 ```
 
+## Congestion Control
+
+`cpp-quic` supports multiple congestion control algorithms to adjust data transmission rates according to network congestion and packet loss.
+
+The following algorithms are available via the `CongestionControlAlgorithm` enum:
+- `CongestionControlAlgorithm::NewReno` (Default): Implements standard QUIC congestion control and packet pacing (RFC 9002).
+- `CongestionControlAlgorithm::Cubic`: Implements CUBIC congestion control using a cubic window growth function.
+- `CongestionControlAlgorithm::ConstantWindow`: Disables dynamic pacing by maintaining a large fixed congestion window (useful for benchmarks or controlled high-speed networks).
+
+### Setting Congestion Control
+
+You can specify the default congestion control algorithm on `QuicClient` and `QuicServer` before establishing connections:
+
+```cpp
+// Configure client to use CUBIC
+client.SetCongestionControlAlgorithm(cppquic::CongestionControlAlgorithm::Cubic);
+
+// Configure server to use ConstantWindow
+server.SetCongestionControlAlgorithm(cppquic::CongestionControlAlgorithm::ConstantWindow);
+```
+
+### Inspecting Congestion Controller State
+
+For debugging or metrics collection, you can query congestion window details from an active connection:
+
+```cpp
+auto conn = client.GetConnection();
+if (conn) {
+    auto* cc = conn->GetCongestionController();
+    if (cc) {
+        std::cout << "CC Algorithm: " << cc->GetName() << "\n"
+                  << "Congestion Window: " << cc->GetCongestionWindow() << " bytes\n"
+                  << "Bytes in Flight: " << cc->GetBytesInFlight() << " bytes" << std::endl;
+    }
+}
+```
+
 ## Graceful Close
 
 To close a connection gracefully:
