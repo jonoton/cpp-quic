@@ -33,7 +33,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 2;
+constexpr int VERSION_MINOR = 3;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -2368,13 +2368,28 @@ class QuicConnection {
     pkt.packet_number = next_packet_number_++;
     pkt.frames = std::move(frames);
 
-    // Track sent packet for retransmission
-    SentPacketInfo info;
-    info.packet_number = pkt.packet_number;
-    info.send_time = std::chrono::steady_clock::now();
-    info.frames = pkt.frames;
-    info.packet_type = pkt.packet_type;
-    sent_packets_[pkt.packet_number] = std::move(info);
+    // Track sent packet for retransmission only if it is ack-eliciting
+    bool ack_eliciting = false;
+    if (pkt.frames.empty()) {
+      ack_eliciting = true;
+    } else {
+      for (const auto &frame : pkt.frames) {
+        if (!std::holds_alternative<AckFrame>(frame) &&
+            !std::holds_alternative<ConnectionCloseFrame>(frame) &&
+            !std::holds_alternative<PaddingFrame>(frame)) {
+          ack_eliciting = true;
+          break;
+        }
+      }
+    }
+    if (ack_eliciting) {
+      SentPacketInfo info;
+      info.packet_number = pkt.packet_number;
+      info.send_time = std::chrono::steady_clock::now();
+      info.frames = pkt.frames;
+      info.packet_type = pkt.packet_type;
+      sent_packets_[pkt.packet_number] = std::move(info);
+    }
 
     return pkt;
   }
@@ -2988,6 +3003,14 @@ class QuicServer {
   }
 
   /**
+   * @brief Returns the number of active connections.
+   */
+  size_t GetActiveConnectionCount() const {
+    std::lock_guard<std::mutex> lock(connections_mtx_);
+    return connections_.size();
+  }
+
+  /**
    * @brief Starts the QUIC server.
    * @throws std::runtime_error if already started.
    */
@@ -3031,7 +3054,7 @@ class QuicServer {
       for (auto &[id, conn] : connections_) {
         if (conn->GetState() == ConnectionState::Connected) {
           auto close_pkt = conn->CreateClosePacket(0, "Server shutting down");
-          auto bytes = close_pkt.Serialize();
+          auto bytes = conn->SerializePacket(close_pkt);
           listener_.Send(conn->GetPeer(), bytes);
           conn->SetState(ConnectionState::Closed);
         }

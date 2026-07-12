@@ -32,17 +32,25 @@ int main() {
     server_ready.store(true);
     std::cout << "[Server] Listening on port 4434..." << std::endl;
 
-    // Wait until enough data received or timeout
     auto start = std::chrono::steady_clock::now();
-    uint64_t expected = NUM_STREAMS * BYTES_PER_STREAM;
-    while (server_bytes_received < expected) {
-      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(15)) {
+    // Wait for client to connect
+    while (server.GetActiveConnectionCount() == 0) {
+      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    // Wait for client to disconnect or timeout
+    auto last_activity = std::chrono::steady_clock::now();
+    while (server.GetActiveConnectionCount() > 0) {
+      if (std::chrono::steady_clock::now() - last_activity >
+          std::chrono::seconds(15)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
     server.Stop();
     std::cout << "[Server] Stopped." << std::endl;
   });

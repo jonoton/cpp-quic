@@ -45,26 +45,28 @@ void RunServer() {
   }
 
   auto server_start = std::chrono::steady_clock::now();
-  uint64_t last_received = 0;
-  auto last_recv_time = std::chrono::steady_clock::now();
 
-  while (server_bytes_received < TOTAL_BYTES) {
+  // Wait for client to connect
+  while (server.GetActiveConnectionCount() == 0) {
     auto now = std::chrono::steady_clock::now();
-    if (now - server_start > std::chrono::seconds(30)) {
-      std::cerr << "[Server] Wait timeout reached." << std::endl;
+    if (now - server_start > std::chrono::seconds(10)) {
+      std::cerr << "[Server] Timeout waiting for client to connect."
+                << std::endl;
       break;
     }
-    if (server_bytes_received > 0 && server_bytes_received == last_received) {
-      if (now - last_recv_time > std::chrono::seconds(5)) {
-        std::cout << "[Server] No data for 5 seconds. Stopping wait."
-                  << std::endl;
-        break;
-      }
-    } else if (server_bytes_received > last_received) {
-      last_received = server_bytes_received;
-      last_recv_time = now;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // Wait for client to disconnect or timeout
+  auto last_activity = std::chrono::steady_clock::now();
+  while (server.GetActiveConnectionCount() > 0) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_activity > std::chrono::seconds(15)) {
+      std::cout << "[Server] Timeout waiting for client to disconnect."
+                << std::endl;
+      break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
   server.Stop();
