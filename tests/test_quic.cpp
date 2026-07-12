@@ -1570,3 +1570,74 @@ TEST(IntegrationTest, StatelessReset) {
   EXPECT_TRUE(reset_detected);
   EXPECT_EQ(client_conn->GetState(), cppquic::ConnectionState::Closed);
 }
+
+TEST(StandardQUICComplianceTest, VariableLengthCidAndHeaderProtection) {
+  // Test variable-length CID
+  cppquic::ConnectionId cid;
+  cid.length = 12;
+  std::memset(cid.data, 0xAA, 12);
+
+  std::vector<uint8_t> buf;
+  cid.Serialize(buf);
+  EXPECT_EQ(buf.size(), 12u);
+
+  cppquic::ConnectionId deserialized;
+  size_t offset = 0;
+  EXPECT_TRUE(cppquic::ConnectionId::Deserialize(buf.data(), buf.size(), offset,
+                                                 deserialized, 12));
+  EXPECT_EQ(deserialized.length, 12u);
+  EXPECT_EQ(cid, deserialized);
+
+  // Test Header Protection and encryption/decryption
+  cppquic::QuicPacket pkt;
+  pkt.packet_type = 1;  // Initial
+  pkt.connection_id = cid;
+  pkt.source_connection_id = cid;
+  pkt.packet_number = 42;
+
+  cppquic::PingFrame ping;
+  pkt.frames.push_back(ping);
+
+  std::vector<uint8_t> key(16, 0x1);
+  std::vector<uint8_t> iv(12, 0x2);
+  std::vector<uint8_t> hp(16, 0x3);
+
+  auto serialized = pkt.Serialize(&key, &iv, &hp);
+
+  cppquic::QuicPacket parsed;
+  bool ok =
+      cppquic::QuicPacket::Deserialize(serialized, parsed, &key, &iv, &hp, 12);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(parsed.packet_type, 1);
+  EXPECT_EQ(parsed.packet_number, 42u);
+  EXPECT_EQ(parsed.connection_id, cid);
+  EXPECT_EQ(parsed.source_connection_id, cid);
+  EXPECT_EQ(parsed.frames.size(), 1u);
+  EXPECT_TRUE(std::holds_alternative<cppquic::PingFrame>(parsed.frames[0]));
+}
+
+TEST(StandardQUICComplianceTest, KeylogParsing) {
+  cppquic::ConnectionId client_cid{1, 2, 3, 4, 5, 6, 7, 8};
+  cppquic::ConnectionId server_cid{8, 7, 6, 5, 4, 3, 2, 1};
+  cppudpnet::PeerAddress server_addr{"127.0.0.1", 12345};
+
+  cppquic::QuicConnection conn(client_cid, server_cid, server_addr, false);
+
+  // Feed mock keylog lines
+  conn.HandleKeylogLine(
+      "CLIENT_HANDSHAKE_TRAFFIC_SECRET "
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f "
+      "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+  conn.HandleKeylogLine(
+      "SERVER_HANDSHAKE_TRAFFIC_SECRET "
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f "
+      "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
+
+  auto crypto = conn.GetCryptoContext();
+  EXPECT_FALSE(crypto->handshake_write_key.empty());
+  EXPECT_FALSE(crypto->handshake_write_iv.empty());
+  EXPECT_FALSE(crypto->handshake_write_hp.empty());
+  EXPECT_FALSE(crypto->handshake_read_key.empty());
+  EXPECT_FALSE(crypto->handshake_read_iv.empty());
+  EXPECT_FALSE(crypto->handshake_read_hp.empty());
+}
