@@ -33,7 +33,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 1;
+constexpr int VERSION_MINOR = 2;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -555,12 +555,28 @@ inline bool IsBidirectional(uint64_t stream_id) {
  * @brief QUIC frame type identifiers.
  */
 enum class FrameType : uint8_t {
-  STREAM = 0x08,
-  ACK = 0x02,
-  CRYPTO = 0x06,
+  PADDING = 0x00,
   PING = 0x01,
-  CONNECTION_CLOSE = 0x1c,
+  ACK = 0x02,
   RESET_STREAM = 0x04,
+  STOP_SENDING = 0x05,
+  CRYPTO = 0x06,
+  NEW_TOKEN = 0x07,
+  STREAM = 0x08,  // 0x08 to 0x0F
+  MAX_DATA = 0x10,
+  MAX_STREAM_DATA = 0x11,
+  MAX_STREAMS_BIDI = 0x12,
+  MAX_STREAMS_UNI = 0x13,
+  DATA_BLOCKED = 0x14,
+  STREAM_DATA_BLOCKED = 0x15,
+  STREAMS_BLOCKED_BIDI = 0x16,
+  STREAMS_BLOCKED_UNI = 0x17,
+  NEW_CONNECTION_ID = 0x18,
+  RETIRE_CONNECTION_ID = 0x19,
+  PATH_CHALLENGE = 0x1a,
+  PATH_RESPONSE = 0x1b,
+  CONNECTION_CLOSE = 0x1c,  // 0x1c or 0x1d
+  HANDSHAKE_DONE = 0x1e,
 };
 
 /**
@@ -613,10 +629,119 @@ struct ResetStreamFrame {
 };
 
 /**
+ * @brief A PADDING frame for padding packets.
+ */
+struct PaddingFrame {};
+
+/**
+ * @brief A STOP_SENDING frame to request termination of a stream.
+ */
+struct StopSendingFrame {
+  uint64_t stream_id = 0;
+  uint64_t error_code = 0;
+};
+
+/**
+ * @brief A NEW_TOKEN frame to provide a client with a token.
+ */
+struct NewTokenFrame {
+  std::vector<uint8_t> token;
+};
+
+/**
+ * @brief A MAX_DATA frame to increase connection flow control limit.
+ */
+struct MaxDataFrame {
+  uint64_t max_data = 0;
+};
+
+/**
+ * @brief A MAX_STREAM_DATA frame to increase stream flow control limit.
+ */
+struct MaxStreamDataFrame {
+  uint64_t stream_id = 0;
+  uint64_t max_stream_data = 0;
+};
+
+/**
+ * @brief A MAX_STREAMS frame to increase stream limits.
+ */
+struct MaxStreamsFrame {
+  bool unidirectional = false;
+  uint64_t max_streams = 0;
+};
+
+/**
+ * @brief A DATA_BLOCKED frame to signal connection flow control limit reached.
+ */
+struct DataBlockedFrame {
+  uint64_t data_limit = 0;
+};
+
+/**
+ * @brief A STREAM_DATA_BLOCKED frame to signal stream flow control limit
+ * reached.
+ */
+struct StreamDataBlockedFrame {
+  uint64_t stream_id = 0;
+  uint64_t stream_data_limit = 0;
+};
+
+/**
+ * @brief A STREAMS_BLOCKED frame to signal stream limit reached.
+ */
+struct StreamsBlockedFrame {
+  bool unidirectional = false;
+  uint64_t stream_limit = 0;
+};
+
+/**
+ * @brief A NEW_CONNECTION_ID frame to offer an alternative Connection ID.
+ */
+struct NewConnectionIdFrame {
+  uint64_t sequence_number = 0;
+  uint64_t retire_prior_to = 0;
+  ConnectionId connection_id;
+  std::vector<uint8_t> stateless_reset_token;
+};
+
+/**
+ * @brief A RETIRE_CONNECTION_ID frame to retire an alternative Connection ID.
+ */
+struct RetireConnectionIdFrame {
+  uint64_t sequence_number = 0;
+};
+
+/**
+ * @brief A PATH_CHALLENGE frame for path validation.
+ */
+struct PathChallengeFrame {
+  uint8_t data[8] = {0};
+};
+
+/**
+ * @brief A PATH_RESPONSE frame responding to a path challenge.
+ */
+struct PathResponseFrame {
+  uint8_t data[8] = {0};
+};
+
+/**
+ * @brief A HANDSHAKE_DONE frame signals handshake completion.
+ */
+struct HandshakeDoneFrame {};
+
+/**
  * @brief A variant type encompassing all QUIC frame types.
  */
-using QuicFrame = std::variant<StreamFrame, AckFrame, CryptoFrame, PingFrame,
-                               ConnectionCloseFrame, ResetStreamFrame>;
+using QuicFrame =
+    std::variant<StreamFrame, AckFrame, CryptoFrame, PingFrame,
+                 ConnectionCloseFrame, ResetStreamFrame, PaddingFrame,
+                 StopSendingFrame, NewTokenFrame, MaxDataFrame,
+                 MaxStreamDataFrame, MaxStreamsFrame, DataBlockedFrame,
+                 StreamDataBlockedFrame, StreamsBlockedFrame,
+                 NewConnectionIdFrame, RetireConnectionIdFrame,
+                 PathChallengeFrame, PathResponseFrame, HandshakeDoneFrame>;
 
 // ============================================================================
 // Serialization Helpers
@@ -731,6 +856,80 @@ inline void SerializeFrame(std::vector<uint8_t> &buf, const QuicFrame &frame) {
           WriteVarInt(buf, f.stream_id);
           WriteVarInt(buf, f.error_code);
           WriteVarInt(buf, f.final_size);
+
+        } else if constexpr (std::is_same_v<T, PaddingFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::PADDING));
+
+        } else if constexpr (std::is_same_v<T, StopSendingFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::STOP_SENDING));
+          WriteVarInt(buf, f.stream_id);
+          WriteVarInt(buf, f.error_code);
+
+        } else if constexpr (std::is_same_v<T, NewTokenFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::NEW_TOKEN));
+          WriteVarInt(buf, f.token.size());
+          WriteBytes(buf, f.token.data(), f.token.size());
+
+        } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::MAX_DATA));
+          WriteVarInt(buf, f.max_data);
+
+        } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::MAX_STREAM_DATA));
+          WriteVarInt(buf, f.stream_id);
+          WriteVarInt(buf, f.max_stream_data);
+
+        } else if constexpr (std::is_same_v<T, MaxStreamsFrame>) {
+          uint8_t type =
+              f.unidirectional
+                  ? static_cast<uint8_t>(FrameType::MAX_STREAMS_UNI)
+                  : static_cast<uint8_t>(FrameType::MAX_STREAMS_BIDI);
+          WriteVarInt(buf, type);
+          WriteVarInt(buf, f.max_streams);
+
+        } else if constexpr (std::is_same_v<T, DataBlockedFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::DATA_BLOCKED));
+          WriteVarInt(buf, f.data_limit);
+
+        } else if constexpr (std::is_same_v<T, StreamDataBlockedFrame>) {
+          WriteVarInt(buf,
+                      static_cast<uint64_t>(FrameType::STREAM_DATA_BLOCKED));
+          WriteVarInt(buf, f.stream_id);
+          WriteVarInt(buf, f.stream_data_limit);
+
+        } else if constexpr (std::is_same_v<T, StreamsBlockedFrame>) {
+          uint8_t type =
+              f.unidirectional
+                  ? static_cast<uint8_t>(FrameType::STREAMS_BLOCKED_UNI)
+                  : static_cast<uint8_t>(FrameType::STREAMS_BLOCKED_BIDI);
+          WriteVarInt(buf, type);
+          WriteVarInt(buf, f.stream_limit);
+
+        } else if constexpr (std::is_same_v<T, NewConnectionIdFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::NEW_CONNECTION_ID));
+          WriteVarInt(buf, f.sequence_number);
+          WriteVarInt(buf, f.retire_prior_to);
+          WriteUint8(buf, 8);  // Connection ID Length (fixed to 8)
+          f.connection_id.Serialize(buf);
+          std::vector<uint8_t> reset_token = f.stateless_reset_token;
+          reset_token.resize(16, 0);  // Ensure exactly 16 bytes
+          WriteBytes(buf, reset_token.data(), 16);
+
+        } else if constexpr (std::is_same_v<T, RetireConnectionIdFrame>) {
+          WriteVarInt(buf,
+                      static_cast<uint64_t>(FrameType::RETIRE_CONNECTION_ID));
+          WriteVarInt(buf, f.sequence_number);
+
+        } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::PATH_CHALLENGE));
+          WriteBytes(buf, f.data, 8);
+
+        } else if constexpr (std::is_same_v<T, PathResponseFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::PATH_RESPONSE));
+          WriteBytes(buf, f.data, 8);
+
+        } else if constexpr (std::is_same_v<T, HandshakeDoneFrame>) {
+          WriteVarInt(buf, static_cast<uint64_t>(FrameType::HANDSHAKE_DONE));
         }
       },
       frame);
@@ -765,6 +964,14 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
   auto frame_type = static_cast<FrameType>(frame_type_raw);
 
   switch (frame_type) {
+    case FrameType::PADDING: {
+      out = PaddingFrame{};
+      return true;
+    }
+    case FrameType::PING: {
+      out = PingFrame{};
+      return true;
+    }
     case FrameType::ACK: {
       AckFrame f;
       if (!ReadVarInt(buf, len, offset, f.largest_acknowledged)) return false;
@@ -779,6 +986,21 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       out = std::move(f);
       return true;
     }
+    case FrameType::RESET_STREAM: {
+      ResetStreamFrame f;
+      if (!ReadVarInt(buf, len, offset, f.stream_id)) return false;
+      if (!ReadVarInt(buf, len, offset, f.error_code)) return false;
+      if (!ReadVarInt(buf, len, offset, f.final_size)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::STOP_SENDING: {
+      StopSendingFrame f;
+      if (!ReadVarInt(buf, len, offset, f.stream_id)) return false;
+      if (!ReadVarInt(buf, len, offset, f.error_code)) return false;
+      out = std::move(f);
+      return true;
+    }
     case FrameType::CRYPTO: {
       CryptoFrame f;
       if (!ReadVarInt(buf, len, offset, f.offset)) return false;
@@ -790,8 +1012,93 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       out = std::move(f);
       return true;
     }
-    case FrameType::PING: {
-      out = PingFrame{};
+    case FrameType::NEW_TOKEN: {
+      NewTokenFrame f;
+      uint64_t token_len = 0;
+      if (!ReadVarInt(buf, len, offset, token_len)) return false;
+      if (offset + token_len > len) return false;
+      f.token.assign(buf + offset, buf + offset + token_len);
+      offset += token_len;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::MAX_DATA: {
+      MaxDataFrame f;
+      if (!ReadVarInt(buf, len, offset, f.max_data)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::MAX_STREAM_DATA: {
+      MaxStreamDataFrame f;
+      if (!ReadVarInt(buf, len, offset, f.stream_id)) return false;
+      if (!ReadVarInt(buf, len, offset, f.max_stream_data)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::MAX_STREAMS_BIDI:
+    case FrameType::MAX_STREAMS_UNI: {
+      MaxStreamsFrame f;
+      f.unidirectional = (frame_type == FrameType::MAX_STREAMS_UNI);
+      if (!ReadVarInt(buf, len, offset, f.max_streams)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::DATA_BLOCKED: {
+      DataBlockedFrame f;
+      if (!ReadVarInt(buf, len, offset, f.data_limit)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::STREAM_DATA_BLOCKED: {
+      StreamDataBlockedFrame f;
+      if (!ReadVarInt(buf, len, offset, f.stream_id)) return false;
+      if (!ReadVarInt(buf, len, offset, f.stream_data_limit)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::STREAMS_BLOCKED_BIDI:
+    case FrameType::STREAMS_BLOCKED_UNI: {
+      StreamsBlockedFrame f;
+      f.unidirectional = (frame_type == FrameType::STREAMS_BLOCKED_UNI);
+      if (!ReadVarInt(buf, len, offset, f.stream_limit)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::NEW_CONNECTION_ID: {
+      NewConnectionIdFrame f;
+      if (!ReadVarInt(buf, len, offset, f.sequence_number)) return false;
+      if (!ReadVarInt(buf, len, offset, f.retire_prior_to)) return false;
+      uint8_t cid_len = 0;
+      if (!ReadUint8(buf, len, offset, cid_len)) return false;
+      if (cid_len != 8) return false;
+      if (!ConnectionId::Deserialize(buf, len, offset, f.connection_id))
+        return false;
+      if (offset + 16 > len) return false;
+      f.stateless_reset_token.assign(buf + offset, buf + offset + 16);
+      offset += 16;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::RETIRE_CONNECTION_ID: {
+      RetireConnectionIdFrame f;
+      if (!ReadVarInt(buf, len, offset, f.sequence_number)) return false;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::PATH_CHALLENGE: {
+      PathChallengeFrame f;
+      if (offset + 8 > len) return false;
+      std::memcpy(f.data, buf + offset, 8);
+      offset += 8;
+      out = std::move(f);
+      return true;
+    }
+    case FrameType::PATH_RESPONSE: {
+      PathResponseFrame f;
+      if (offset + 8 > len) return false;
+      std::memcpy(f.data, buf + offset, 8);
+      offset += 8;
+      out = std::move(f);
       return true;
     }
     case FrameType::CONNECTION_CLOSE: {
@@ -807,12 +1114,8 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       out = std::move(f);
       return true;
     }
-    case FrameType::RESET_STREAM: {
-      ResetStreamFrame f;
-      if (!ReadVarInt(buf, len, offset, f.stream_id)) return false;
-      if (!ReadVarInt(buf, len, offset, f.error_code)) return false;
-      if (!ReadVarInt(buf, len, offset, f.final_size)) return false;
-      out = std::move(f);
+    case FrameType::HANDSHAKE_DONE: {
+      out = HandshakeDoneFrame{};
       return true;
     }
     default:
@@ -908,6 +1211,46 @@ inline void DeriveInitialKeys(const ConnectionId &dest_conn_id, bool is_server,
                      .ToHex()
                      .substr(0, 8)));
 }
+
+inline void DeriveZeroRTTKeys(const ConnectionId &dest_conn_id, bool is_server,
+                              std::vector<uint8_t> &read_key,
+                              std::vector<uint8_t> &read_iv,
+                              std::vector<uint8_t> &write_key,
+                              std::vector<uint8_t> &write_iv) {
+  const std::vector<uint8_t> salt = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                                     0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                                     0xee, 0xff, 0x00, 0x11, 0x22, 0x33};
+  std::vector<uint8_t> dest_conn_id_bytes(dest_conn_id.data,
+                                          dest_conn_id.data + 8);
+  std::vector<uint8_t> initial_secret = HKDF_Extract(salt, dest_conn_id_bytes);
+  std::vector<uint8_t> client_early =
+      HKDF_Expand_Label(initial_secret, "client early", {}, 32);
+  std::vector<uint8_t> server_early =
+      HKDF_Expand_Label(initial_secret, "server early", {}, 32);
+
+  if (is_server) {
+    read_key = HKDF_Expand_Label(client_early, "quic key", {}, 16);
+    read_iv = HKDF_Expand_Label(client_early, "quic iv", {}, 12);
+    write_key = HKDF_Expand_Label(server_early, "quic key", {}, 16);
+    write_iv = HKDF_Expand_Label(server_early, "quic iv", {}, 12);
+  } else {
+    read_key = HKDF_Expand_Label(server_early, "quic key", {}, 16);
+    read_iv = HKDF_Expand_Label(server_early, "quic iv", {}, 12);
+    write_key = HKDF_Expand_Label(client_early, "quic key", {}, 16);
+    write_iv = HKDF_Expand_Label(client_early, "quic iv", {}, 12);
+  }
+}
+
+inline void DeriveStatelessResetToken(const ConnectionId &cid,
+                                      uint8_t token[16]) {
+  const std::vector<uint8_t> salt = {0x73, 0x74, 0x61, 0x74, 0x65, 0x6c, 0x65,
+                                     0x73, 0x73, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f,
+                                     0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f};
+  std::vector<uint8_t> cid_bytes(cid.data, cid.data + 8);
+  std::vector<uint8_t> secret = HKDF_Extract(salt, cid_bytes);
+  std::vector<uint8_t> tok = HKDF_Expand_Label(secret, "reset token", {}, 16);
+  std::memcpy(token, tok.data(), 16);
+}
 }  // namespace internal
 
 struct QuicPacket {
@@ -949,9 +1292,16 @@ struct QuicPacket {
       final_payload = std::move(payload);
     }
 
-    if (packet_type == 1 || packet_type == 2) {
-      // Long Header (Initial or Handshake)
-      uint8_t first = (packet_type == 1) ? 0xc3 : 0xe3;
+    if (packet_type == 1 || packet_type == 2 || packet_type == 3) {
+      // Long Header (Initial, Handshake, or 0-RTT)
+      uint8_t first = 0;
+      if (packet_type == 1)
+        first = 0xc3;
+      else if (packet_type == 2)
+        first = 0xe3;
+      else if (packet_type == 3)
+        first = 0xd3;
+
       internal::WriteUint8(buf, first);
       internal::WriteUint32(buf, 0x00000001);  // Version (QUIC v1)
       internal::WriteUint8(buf, 8);            // Dest ID Len
@@ -1003,6 +1353,60 @@ struct QuicPacket {
     return ConnectionId::Deserialize(data.data(), data.size(), offset, out);
   }
 
+  static std::vector<std::vector<uint8_t>> SplitCoalescedPackets(
+      const std::vector<uint8_t> &data) {
+    std::vector<std::vector<uint8_t>> packets;
+    if (data.empty()) return packets;
+
+    const uint8_t *buf = data.data();
+    size_t len = data.size();
+    size_t offset = 0;
+
+    while (offset < len) {
+      size_t packet_start = offset;
+      uint8_t first = 0;
+      if (!internal::ReadUint8(buf, len, offset, first)) break;
+
+      if (first & 0x80) {
+        // Long Header packet
+        uint32_t version = 0;
+        if (!internal::ReadUint32(buf, len, offset, version)) break;
+
+        uint8_t dest_len = 0;
+        if (!internal::ReadUint8(buf, len, offset, dest_len)) break;
+        if (offset + dest_len > len) break;
+        offset += dest_len;
+
+        uint8_t src_len = 0;
+        if (!internal::ReadUint8(buf, len, offset, src_len)) break;
+        if (offset + src_len > len) break;
+        offset += src_len;
+
+        uint8_t type = (first >> 4) & 0x03;
+        if (type == 0) {  // Initial
+          uint64_t token_len = 0;
+          if (!internal::ReadVarInt(buf, len, offset, token_len)) break;
+          if (offset + token_len > len) break;
+          offset += token_len;
+        }
+
+        uint64_t packet_len = 0;
+        if (!internal::ReadVarInt(buf, len, offset, packet_len)) break;
+        if (offset + packet_len > len) break;
+        offset += packet_len;
+
+        size_t packet_end = offset;
+        packets.push_back(
+            std::vector<uint8_t>(buf + packet_start, buf + packet_end));
+      } else {
+        // Short Header packet (consumes the remaining datagram)
+        packets.push_back(std::vector<uint8_t>(buf + packet_start, buf + len));
+        break;
+      }
+    }
+    return packets;
+  }
+
   /**
    * @brief Deserializes a packet from a byte buffer.
    * @return true on success, false on malformed data.
@@ -1025,6 +1429,8 @@ struct QuicPacket {
         out.packet_type = 1;  // Initial
       } else if (type == 2) {
         out.packet_type = 2;  // Handshake
+      } else if (type == 1) {
+        out.packet_type = 3;  // 0-RTT
       } else {
         return false;  // Unsupported long header type
       }
@@ -1160,7 +1566,8 @@ class QuicStream {
   QuicStream(uint64_t stream_id, uint64_t initial_recv_window = 65536)
       : stream_id_(stream_id),
         recv_window_(initial_recv_window),
-        max_recv_offset_(initial_recv_window) {}
+        max_recv_offset_(initial_recv_window),
+        max_send_offset_(65536) {}
 
   uint64_t GetStreamId() const { return stream_id_; }
 
@@ -1169,46 +1576,92 @@ class QuicStream {
     return state_;
   }
 
+  uint64_t GetMaxSendOffset() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return max_send_offset_;
+  }
+
+  void SetMaxSendOffset(uint64_t max_offset) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    max_send_offset_ = std::max(max_send_offset_, max_offset);
+  }
+
   /**
-   * @brief Writes data to the send buffer.
-   * @param data The data to send.
-   * @param fin If true, marks the end of the stream after this data.
-   * @return The frames generated for this write.
+   * @brief Appends data to the stream send buffer.
    */
-  std::vector<StreamFrame> Write(const std::vector<uint8_t> &data,
-                                 bool fin = false) {
+  void AppendWriteData(const std::vector<uint8_t> &data, bool fin = false) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (state_ == StreamState::HalfClosedLocal ||
+        state_ == StreamState::Closed) {
+      return;
+    }
+    send_buffer_.insert(send_buffer_.end(), data.begin(), data.end());
+    if (fin) {
+      send_fin_pending_ = true;
+    }
+  }
+
+  void AppendWriteData(const std::string &data, bool fin = false) {
+    std::vector<uint8_t> bytes(data.begin(), data.end());
+    AppendWriteData(bytes, fin);
+  }
+
+  /**
+   * @brief Pulls frames up to allowed limit from the stream send buffer.
+   */
+  std::vector<StreamFrame> PullWriteFrames(uint64_t max_conn_allowed) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (state_ == StreamState::HalfClosedLocal ||
         state_ == StreamState::Closed) {
       return {};
     }
 
+    uint64_t stream_allowed = 0;
+    if (max_send_offset_ > send_offset_) {
+      stream_allowed = max_send_offset_ - send_offset_;
+    }
+    uint64_t allowed = std::min(stream_allowed, max_conn_allowed);
+    size_t pull_size =
+        std::min(send_buffer_.size(), static_cast<size_t>(allowed));
+
     std::vector<StreamFrame> frames;
     const size_t max_frame_data = 1200;  // Leave room for headers in MTU
-    size_t remaining = data.size();
     size_t data_offset = 0;
+    size_t remaining = pull_size;
 
-    while (remaining > 0 || (data.empty() && fin)) {
+    while (remaining > 0) {
       StreamFrame frame;
       frame.stream_id = stream_id_;
       frame.offset = send_offset_;
 
       size_t chunk = std::min(remaining, max_frame_data);
-      if (chunk > 0) {
-        frame.data.assign(data.begin() + data_offset,
-                          data.begin() + data_offset + chunk);
-      }
+      frame.data.assign(send_buffer_.begin() + data_offset,
+                        send_buffer_.begin() + data_offset + chunk);
       data_offset += chunk;
       remaining -= chunk;
       send_offset_ += chunk;
 
-      frame.fin = fin && (remaining == 0);
+      frame.fin = false;
       frames.push_back(std::move(frame));
-
-      if (data.empty() && fin) break;
     }
 
-    if (fin) {
+    if (pull_size > 0) {
+      send_buffer_.erase(send_buffer_.begin(),
+                         send_buffer_.begin() + pull_size);
+    }
+
+    if (send_buffer_.empty() && send_fin_pending_) {
+      if (frames.empty()) {
+        StreamFrame frame;
+        frame.stream_id = stream_id_;
+        frame.offset = send_offset_;
+        frame.fin = true;
+        frames.push_back(std::move(frame));
+      } else {
+        frames.back().fin = true;
+      }
+      send_fin_pending_ = false;
+
       if (state_ == StreamState::HalfClosedRemote) {
         state_ = StreamState::Closed;
       } else {
@@ -1220,8 +1673,15 @@ class QuicStream {
   }
 
   /**
-   * @brief Writes string data to the send buffer.
+   * @brief Writes data to the send buffer and immediately returns allowed
+   * frames.
    */
+  std::vector<StreamFrame> Write(const std::vector<uint8_t> &data,
+                                 bool fin = false) {
+    AppendWriteData(data, fin);
+    return PullWriteFrames(std::numeric_limits<uint64_t>::max());
+  }
+
   std::vector<StreamFrame> Write(const std::string &data, bool fin = false) {
     std::vector<uint8_t> bytes(data.begin(), data.end());
     return Write(bytes, fin);
@@ -1317,6 +1777,11 @@ class QuicStream {
     return recv_window_;
   }
 
+  uint64_t GetMaxRecvOffset() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return max_recv_offset_;
+  }
+
  private:
   void FlushRecvBuffer() {
     while (true) {
@@ -1344,6 +1809,9 @@ class QuicStream {
 
   // Send state
   uint64_t send_offset_ = 0;
+  uint64_t max_send_offset_;
+  std::vector<uint8_t> send_buffer_;
+  bool send_fin_pending_ = false;
 
   // Receive state
   uint64_t recv_offset_ = 0;
@@ -1710,6 +2178,12 @@ struct QuicCryptoContext {
   std::vector<uint8_t> write_key;
   std::vector<uint8_t> write_iv;
 
+  // 0-RTT keys
+  std::vector<uint8_t> zerortt_read_key;
+  std::vector<uint8_t> zerortt_read_iv;
+  std::vector<uint8_t> zerortt_write_key;
+  std::vector<uint8_t> zerortt_write_iv;
+
   QuicCryptoContext() = default;
   ~QuicCryptoContext() {
     if (ssl) SSL_free(ssl);
@@ -1749,6 +2223,10 @@ class QuicConnection {
         initial_id, is_server, crypto_ctx_->initial_read_key,
         crypto_ctx_->initial_read_iv, crypto_ctx_->initial_write_key,
         crypto_ctx_->initial_write_iv);
+    internal::DeriveZeroRTTKeys(
+        initial_id, is_server, crypto_ctx_->zerortt_read_key,
+        crypto_ctx_->zerortt_read_iv, crypto_ctx_->zerortt_write_key,
+        crypto_ctx_->zerortt_write_iv);
     congestion_controller_ =
         CreateCongestionController(CongestionControlAlgorithm::NewReno);
   }
@@ -1760,6 +2238,69 @@ class QuicConnection {
     remote_connection_id_ = id;
   }
   cppudpnet::PeerAddress GetPeer() const { return peer_; }
+
+  void SetPeer(const cppudpnet::PeerAddress &peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    peer_ = peer;
+  }
+
+  void InitiatePathValidation(const cppudpnet::PeerAddress &new_peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    path_validated_ = false;
+    candidate_peer_ = new_peer;
+    for (int i = 0; i < 8; ++i) {
+      pending_challenge_[i] = static_cast<uint8_t>(std::rand() & 0xFF);
+    }
+    challenge_pending_ = true;
+
+    PathChallengeFrame challenge;
+    std::memcpy(challenge.data, pending_challenge_, 8);
+
+    std::vector<QuicFrame> frames;
+    frames.push_back(std::move(challenge));
+    pending_packets_.push_back(std::move(frames));
+  }
+
+  bool IsPathValidated() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return path_validated_;
+  }
+
+  void SetPathValidated(bool val) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    path_validated_ = val;
+  }
+
+  cppudpnet::PeerAddress GetCandidatePeer() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return candidate_peer_;
+  }
+
+  void SetCandidatePeer(const cppudpnet::PeerAddress &peer) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    candidate_peer_ = peer;
+  }
+
+  void GetPendingChallenge(uint8_t out[8]) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::memcpy(out, pending_challenge_, 8);
+  }
+
+  void SetPendingChallenge(const uint8_t in[8]) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::memcpy(pending_challenge_, in, 8);
+    challenge_pending_ = true;
+  }
+
+  bool IsChallengePending() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return challenge_pending_;
+  }
+
+  void ClearPendingChallenge() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    challenge_pending_ = false;
+  }
 
   ConnectionState GetState() const {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -1832,6 +2373,7 @@ class QuicConnection {
     info.packet_number = pkt.packet_number;
     info.send_time = std::chrono::steady_clock::now();
     info.frames = pkt.frames;
+    info.packet_type = pkt.packet_type;
     sent_packets_[pkt.packet_number] = std::move(info);
 
     return pkt;
@@ -1859,6 +2401,9 @@ class QuicConnection {
       if (pkt.packet_type == 1 || pkt.packet_type == 2) {
         write_key = &crypto_ctx_->initial_write_key;
         write_iv = &crypto_ctx_->initial_write_iv;
+      } else if (pkt.packet_type == 3) {
+        write_key = &crypto_ctx_->zerortt_write_key;
+        write_iv = &crypto_ctx_->zerortt_write_iv;
       } else {
         if (crypto_ctx_->handshake_complete) {
           write_key = &crypto_ctx_->write_key;
@@ -1895,11 +2440,16 @@ class QuicConnection {
             packet_type = 1;
           else if (type == 2)
             packet_type = 2;
+          else if (type == 1)
+            packet_type = 3;
         }
       }
       if (packet_type == 1 || packet_type == 2) {
         read_key = &crypto_ctx_->initial_read_key;
         read_iv = &crypto_ctx_->initial_read_iv;
+      } else if (packet_type == 3) {
+        read_key = &crypto_ctx_->zerortt_read_key;
+        read_iv = &crypto_ctx_->zerortt_read_iv;
       } else {
         if (crypto_ctx_->handshake_complete) {
           read_key = &crypto_ctx_->read_key;
@@ -2057,6 +2607,7 @@ class QuicConnection {
         pkt.connection_id = remote_connection_id_;
         pkt.packet_number = next_packet_number_++;
         pkt.frames = it->second.frames;
+        pkt.packet_type = it->second.packet_type;
 
         // Track the new packet
         SentPacketInfo new_info;
@@ -2064,6 +2615,7 @@ class QuicConnection {
         new_info.send_time = now;
         new_info.frames = pkt.frames;
         new_info.packet_size = it->second.packet_size;
+        new_info.packet_type = pkt.packet_type;
 
         // Remove old, add new
         sent_packets_.erase(it);
@@ -2235,17 +2787,93 @@ class QuicConnection {
     return congestion_controller_->CanSend(next_packet_size);
   }
 
+  uint64_t GetMaxSendData() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return max_send_data_;
+  }
+
+  void SetMaxSendData(uint64_t val) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    max_send_data_ = std::max(max_send_data_, val);
+  }
+
+  void AddBytesRead(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    total_stream_bytes_read_ += bytes;
+  }
+
+  uint64_t GetMaxRecvData() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return 1048576 + total_stream_bytes_read_;
+  }
+
+  void SetAutoFlowControl(bool enable) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto_flow_control_ = enable;
+  }
+
+  bool IsAutoFlowControlEnabled() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return auto_flow_control_;
+  }
+
+  uint64_t GetTotalStreamBytesSent() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return total_stream_bytes_sent_;
+  }
+
+  void AddTotalStreamBytesSent(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    total_stream_bytes_sent_ += bytes;
+  }
+
+  void GenerateStreamPackets() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (auto &[stream_id, stream] : streams_) {
+      while (true) {
+        uint64_t conn_allowed = 0;
+        if (max_send_data_ > total_stream_bytes_sent_) {
+          conn_allowed = max_send_data_ - total_stream_bytes_sent_;
+        }
+        if (conn_allowed == 0) {
+          break;
+        }
+
+        auto frames = stream->PullWriteFrames(conn_allowed);
+        if (frames.empty()) {
+          break;
+        }
+
+        for (auto &sf : frames) {
+          total_stream_bytes_sent_ += sf.data.size();
+          std::vector<QuicFrame> quic_frames;
+          quic_frames.push_back(std::move(sf));
+          pending_packets_.push_back(std::move(quic_frames));
+        }
+      }
+    }
+  }
+
  private:
+  uint64_t max_send_data_ = 1048576;  // 1MB initial limit
+  uint64_t total_stream_bytes_sent_ = 0;
+  uint64_t total_stream_bytes_read_ = 0;
+  bool auto_flow_control_ = true;
   struct SentPacketInfo {
     uint64_t packet_number = 0;
     std::chrono::steady_clock::time_point send_time;
     std::vector<QuicFrame> frames;
     size_t packet_size = 0;
+    uint8_t packet_type = 0;
   };
 
   ConnectionId local_connection_id_;
   ConnectionId remote_connection_id_;
   cppudpnet::PeerAddress peer_;
+  bool path_validated_ = true;
+  cppudpnet::PeerAddress candidate_peer_;
+  uint8_t pending_challenge_[8] = {0};
+  bool challenge_pending_ = false;
   bool is_server_;
 
   std::shared_ptr<QuicCryptoContext> crypto_ctx_;
@@ -2371,7 +2999,10 @@ class QuicServer {
     listener_.SetDataHandler([this](uint64_t session_id,
                                     const cppudpnet::PeerAddress &peer,
                                     const std::vector<uint8_t> &data) {
-      HandleIncomingPacket(peer, data);
+      auto packets = QuicPacket::SplitCoalescedPackets(data);
+      for (const auto &pkt_bytes : packets) {
+        HandleIncomingPacket(peer, pkt_bytes);
+      }
     });
 
     listener_.Start();
@@ -2461,25 +3092,25 @@ class QuicServer {
     if (!conn) return;
     while (conn->HasPendingPackets() && conn->CanSend(1200)) {
       auto frames = conn->PopPendingPacket();
-      auto pkt = conn->CreatePacket(std::move(frames));
+      uint8_t pkt_type =
+          (conn->GetState() == ConnectionState::Handshaking) ? 3 : 0;
+      auto pkt = conn->CreatePacket(std::move(frames), pkt_type);
       auto bytes = conn->SerializePacket(pkt);
       conn->AddBytesSent(bytes.size());
-      listener_.Send(conn->GetPeer(), bytes);
+
+      cppudpnet::PeerAddress dest = conn->GetPeer();
+      if (!conn->IsPathValidated() && conn->IsChallengePending()) {
+        dest = conn->GetCandidatePeer();
+      }
+      listener_.Send(dest, bytes);
     }
   }
 
   void SendOnStream(std::shared_ptr<QuicConnection> conn, uint64_t stream_id,
                     const std::vector<uint8_t> &data, bool fin = false) {
     auto stream = conn->GetOrCreateStream(stream_id);
-    auto frames = stream->Write(data, fin);
-
-    if (!frames.empty()) {
-      std::vector<QuicFrame> quic_frames;
-      for (auto &sf : frames) {
-        quic_frames.push_back(std::move(sf));
-      }
-      conn->QueuePendingPacket(std::move(quic_frames));
-    }
+    stream->AppendWriteData(data, fin);
+    conn->GenerateStreamPackets();
     SendPendingPackets(conn);
   }
 
@@ -2515,6 +3146,8 @@ class QuicServer {
   void SetCongestionControlAlgorithm(CongestionControlAlgorithm algorithm) {
     cc_algorithm_ = algorithm;
   }
+
+  void SetAutoFlowControl(bool enable) { auto_flow_control_ = enable; }
 
   /**
    * @brief Gets a connection by its connection ID.
@@ -2554,6 +3187,30 @@ class QuicServer {
         return;
       }
     } else {
+      bool is_initial = false;
+      if (!data.empty() && (data[0] & 0x80)) {
+        uint8_t type = (data[0] >> 4) & 0x03;
+        if (type == 0) is_initial = true;
+      }
+
+      if (!is_initial) {
+        uint8_t token[16];
+        internal::DeriveStatelessResetToken(conn_id, token);
+
+        std::vector<uint8_t> reset_pkt(40);
+        reset_pkt[0] = 0x43;
+        for (size_t i = 1; i < 24; ++i) {
+          reset_pkt[i] = static_cast<uint8_t>(std::rand() & 0xFF);
+        }
+        std::memcpy(reset_pkt.data() + 24, token, 16);
+
+        listener_.Send(peer, reset_pkt);
+        internal::Log(
+            LogSeverity::Info, "QuicServer",
+            "Sent Stateless Reset to unknown client " + peer.ToString());
+        return;
+      }
+
       // Derive Initial keys to decrypt ClientHello
       std::vector<uint8_t> temp_read_key;
       std::vector<uint8_t> temp_read_iv;
@@ -2579,6 +3236,7 @@ class QuicServer {
             if constexpr (std::is_same_v<T, CryptoFrame>) {
               if (conn) {
                 conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
                 std::vector<uint8_t> crypto_out;
                 conn->ProcessCrypto(f.data, crypto_out);
 
@@ -2599,7 +3257,11 @@ class QuicServer {
               } else {
                 // If conn doesn't exist, this is ClientHello (represented in
                 // CryptoFrame)
-                HandleClientHello(peer, conn_id, pkt.source_connection_id, f);
+                conn = HandleClientHello(peer, conn_id,
+                                         pkt.source_connection_id, f);
+                if (conn) {
+                  conn->RecordReceivedPacket(pkt.packet_number);
+                }
               }
             } else if constexpr (std::is_same_v<T, StreamFrame>) {
               if (conn) {
@@ -2634,15 +3296,75 @@ class QuicServer {
                   stream->Reset(f.error_code);
                 }
               }
+            } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
+              if (conn) {
+                conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
+                PathResponseFrame resp;
+                std::memcpy(resp.data, f.data, 8);
+                auto pkt_out = conn->CreatePacket({resp});
+                auto bytes = conn->SerializePacket(pkt_out);
+                conn->AddBytesSent(bytes.size());
+                listener_.Send(peer, bytes);
+              }
+            } else if constexpr (std::is_same_v<T, PathResponseFrame>) {
+              if (conn) {
+                conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
+                uint8_t pending[8];
+                conn->GetPendingChallenge(pending);
+                if (conn->IsChallengePending() &&
+                    std::memcmp(pending, f.data, 8) == 0) {
+                  conn->ClearPendingChallenge();
+                  conn->SetPathValidated(true);
+                  conn->SetPeer(peer);
+                }
+              }
+            } else if constexpr (std::is_same_v<T, StopSendingFrame>) {
+              if (conn) {
+                conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
+                auto stream = conn->GetStream(f.stream_id);
+                if (stream) {
+                  stream->Reset(f.error_code);
+                  ResetStreamFrame reset;
+                  reset.stream_id = f.stream_id;
+                  reset.error_code = f.error_code;
+                  reset.final_size = stream->GetSendOffset();
+                  auto pkt_out = conn->CreatePacket({reset});
+                  auto bytes = conn->SerializePacket(pkt_out);
+                  conn->AddBytesSent(bytes.size());
+                  listener_.Send(conn->GetPeer(), bytes);
+                }
+              }
+            } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
+              if (conn) {
+                conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
+                conn->SetMaxSendData(f.max_data);
+                conn->GenerateStreamPackets();
+                SendPendingPackets(conn);
+              }
+            } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
+              if (conn) {
+                conn->Touch();
+                conn->RecordReceivedPacket(pkt.packet_number);
+                auto stream = conn->GetStream(f.stream_id);
+                if (stream) {
+                  stream->SetMaxSendOffset(f.max_stream_data);
+                  conn->GenerateStreamPackets();
+                  SendPendingPackets(conn);
+                }
+              }
             }
           },
           frame);
     }
   }
 
-  void HandleClientHello(const cppudpnet::PeerAddress &peer,
-                         const ConnectionId &dest_id,
-                         const ConnectionId &src_id, const CryptoFrame &cf) {
+  std::shared_ptr<QuicConnection> HandleClientHello(
+      const cppudpnet::PeerAddress &peer, const ConnectionId &dest_id,
+      const ConnectionId &src_id, const CryptoFrame &cf) {
     auto local_id = internal::GenerateConnectionId();
     auto remote_id = src_id;
 
@@ -2651,6 +3373,7 @@ class QuicServer {
     auto conn = std::make_shared<QuicConnection>(local_id, remote_id, peer,
                                                  true, ssl_ctx_, dest_id);
     conn->SetCongestionControlAlgorithm(cc_algorithm_);
+    conn->SetAutoFlowControl(auto_flow_control_);
     conn->SetState(ConnectionState::Handshaking);
 
     {
@@ -2668,18 +3391,38 @@ class QuicServer {
     internal::Log(LogSeverity::Info, "QuicServer",
                   "New handshaking connection from " + peer.ToString() + " [" +
                       local_id.ToHex() + "]");
+    return conn;
   }
 
   void HandleStreamFrame(std::shared_ptr<QuicConnection> conn,
                          const StreamFrame &frame) {
     auto stream = conn->GetOrCreateStream(frame.stream_id);
-    stream->OnStreamFrame(frame);
+    bool ok = stream->OnStreamFrame(frame);
 
     // Send ACK
     SendAck(conn);
 
     if (stream_data_handler_) {
       stream_data_handler_(conn, frame.stream_id, frame.data, frame.fin);
+    }
+
+    if (ok && conn->IsAutoFlowControlEnabled()) {
+      stream->Read(0);
+      conn->AddBytesRead(frame.data.size());
+      MaxStreamDataFrame max_stream;
+      max_stream.stream_id = frame.stream_id;
+      max_stream.max_stream_data = stream->GetMaxRecvOffset();
+
+      MaxDataFrame max_data;
+      max_data.max_data = conn->GetMaxRecvData();
+
+      std::vector<QuicFrame> frames;
+      frames.push_back(std::move(max_stream));
+      frames.push_back(std::move(max_data));
+      auto pkt = conn->CreatePacket(std::move(frames));
+      auto bytes = conn->SerializePacket(pkt);
+      conn->AddBytesSent(bytes.size());
+      listener_.Send(conn->GetPeer(), bytes);
     }
   }
 
@@ -2767,6 +3510,7 @@ class QuicServer {
   std::chrono::milliseconds idle_timeout_{60000};
   CongestionControlAlgorithm cc_algorithm_ =
       CongestionControlAlgorithm::NewReno;
+  bool auto_flow_control_ = true;
 };
 
 // ============================================================================
@@ -2851,7 +3595,10 @@ class QuicClient {
 
     sender_.SetDataHandler([this](const cppudpnet::PeerAddress &peer,
                                   const std::vector<uint8_t> &data) {
-      HandleIncomingPacket(peer, data);
+      auto packets = QuicPacket::SplitCoalescedPackets(data);
+      for (const auto &pkt_bytes : packets) {
+        HandleIncomingPacket(peer, pkt_bytes);
+      }
     });
 
     sender_.Start();
@@ -2921,6 +3668,7 @@ class QuicClient {
     connection_ = std::make_shared<QuicConnection>(
         local_id, remote_id, server_address_, false, ssl_ctx_);
     connection_->SetCongestionControlAlgorithm(cc_algorithm_);
+    connection_->SetAutoFlowControl(auto_flow_control_);
     connection_->SetState(ConnectionState::Handshaking);
 
     std::vector<uint8_t> crypto_out;
@@ -2999,33 +3747,43 @@ class QuicClient {
     }
   }
 
+  void SetAutoFlowControl(bool enable) {
+    auto_flow_control_ = enable;
+    if (connection_) {
+      connection_->SetAutoFlowControl(enable);
+    }
+  }
+
   void SendPendingPackets() {
     if (!connection_) return;
     while (connection_->HasPendingPackets() && connection_->CanSend(1200)) {
       auto frames = connection_->PopPendingPacket();
-      auto pkt = connection_->CreatePacket(std::move(frames));
+      uint8_t pkt_type =
+          (connection_->GetState() == ConnectionState::Handshaking) ? 3 : 0;
+      auto pkt = connection_->CreatePacket(std::move(frames), pkt_type);
       auto bytes = connection_->SerializePacket(pkt);
       connection_->AddBytesSent(bytes.size());
-      sender_.Send(server_address_, bytes);
+
+      cppudpnet::PeerAddress dest = server_address_;
+      if (!connection_->IsPathValidated() &&
+          connection_->IsChallengePending()) {
+        dest = connection_->GetCandidatePeer();
+      }
+      sender_.Send(dest, bytes);
     }
   }
 
   void SendOnStream(uint64_t stream_id, const std::vector<uint8_t> &data,
                     bool fin = false) {
-    if (!connection_ || connection_->GetState() != ConnectionState::Connected) {
+    if (!connection_ ||
+        (connection_->GetState() != ConnectionState::Connected &&
+         connection_->GetState() != ConnectionState::Handshaking)) {
       return;
     }
 
     auto stream = connection_->GetOrCreateStream(stream_id);
-    auto frames = stream->Write(data, fin);
-
-    if (!frames.empty()) {
-      std::vector<QuicFrame> quic_frames;
-      for (auto &sf : frames) {
-        quic_frames.push_back(std::move(sf));
-      }
-      connection_->QueuePendingPacket(std::move(quic_frames));
-    }
+    stream->AppendWriteData(data, fin);
+    connection_->GenerateStreamPackets();
     SendPendingPackets();
   }
 
@@ -3086,6 +3844,19 @@ class QuicClient {
     QuicPacket pkt;
     if (connection_) {
       if (!connection_->DeserializePacket(data, pkt)) {
+        if (data.size() >= 21) {
+          uint8_t expected_token[16];
+          internal::DeriveStatelessResetToken(
+              connection_->GetRemoteConnectionId(), expected_token);
+          if (std::memcmp(data.data() + data.size() - 16, expected_token, 16) ==
+              0) {
+            internal::Log(
+                LogSeverity::Info, "QuicClient",
+                "Stateless Reset received from server! Closing connection.");
+            connection_->SetState(ConnectionState::Closed);
+            return;
+          }
+        }
         internal::Log(LogSeverity::Warn, "QuicClient",
                       "Failed to deserialize packet from server");
         return;
@@ -3108,11 +3879,12 @@ class QuicClient {
 
     for (const auto &frame : pkt.frames) {
       std::visit(
-          [this, &pkt](auto &&f) {
+          [this, &pkt, &peer](auto &&f) {
             using T = std::decay_t<decltype(f)>;
 
             if constexpr (std::is_same_v<T, CryptoFrame>) {
               if (connection_) {
+                connection_->RecordReceivedPacket(pkt.packet_number);
                 // Server source connection ID is updated in the connection!
                 connection_->SetRemoteConnectionId(pkt.source_connection_id);
 
@@ -3140,13 +3912,32 @@ class QuicClient {
                 connection_->AddBytesReceived(f.data.size());
 
                 auto stream = connection_->GetOrCreateStream(f.stream_id);
-                stream->OnStreamFrame(f);
+                bool ok = stream->OnStreamFrame(f);
 
                 // Send ACK
                 SendAck();
 
                 if (stream_data_handler_) {
                   stream_data_handler_(f.stream_id, f.data, f.fin);
+                }
+
+                if (ok && connection_->IsAutoFlowControlEnabled()) {
+                  stream->Read(0);
+                  connection_->AddBytesRead(f.data.size());
+                  MaxStreamDataFrame max_stream;
+                  max_stream.stream_id = f.stream_id;
+                  max_stream.max_stream_data = stream->GetMaxRecvOffset();
+
+                  MaxDataFrame max_data;
+                  max_data.max_data = connection_->GetMaxRecvData();
+
+                  std::vector<QuicFrame> frames;
+                  frames.push_back(std::move(max_stream));
+                  frames.push_back(std::move(max_data));
+                  auto pkt_out = connection_->CreatePacket(std::move(frames));
+                  auto bytes = connection_->SerializePacket(pkt_out);
+                  connection_->AddBytesSent(bytes.size());
+                  sender_.Send(server_address_, bytes);
                 }
               }
             } else if constexpr (std::is_same_v<T, AckFrame>) {
@@ -3171,6 +3962,77 @@ class QuicClient {
                 auto stream = connection_->GetStream(f.stream_id);
                 if (stream) {
                   stream->Reset(f.error_code);
+                }
+              }
+            } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                PathResponseFrame resp;
+                std::memcpy(resp.data, f.data, 8);
+                auto pkt_out = connection_->CreatePacket({resp});
+                auto bytes = connection_->SerializePacket(pkt_out);
+                connection_->AddBytesSent(bytes.size());
+                sender_.Send(peer, bytes);
+              }
+            } else if constexpr (std::is_same_v<T, PathResponseFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                uint8_t pending[8];
+                connection_->GetPendingChallenge(pending);
+                if (connection_->IsChallengePending() &&
+                    std::memcmp(pending, f.data, 8) == 0) {
+                  connection_->ClearPendingChallenge();
+                  connection_->SetPathValidated(true);
+                  connection_->SetPeer(peer);
+                }
+              }
+            } else if constexpr (std::is_same_v<T, StopSendingFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                auto stream = connection_->GetStream(f.stream_id);
+                if (stream) {
+                  stream->Reset(f.error_code);
+                  ResetStreamFrame reset;
+                  reset.stream_id = f.stream_id;
+                  reset.error_code = f.error_code;
+                  reset.final_size = stream->GetSendOffset();
+                  auto pkt_out = connection_->CreatePacket({reset});
+                  auto bytes = connection_->SerializePacket(pkt_out);
+                  connection_->AddBytesSent(bytes.size());
+                  sender_.Send(server_address_, bytes);
+                }
+              }
+            } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                connection_->SetMaxSendData(f.max_data);
+                connection_->GenerateStreamPackets();
+                SendPendingPackets();
+              }
+            } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                auto stream = connection_->GetStream(f.stream_id);
+                if (stream) {
+                  stream->SetMaxSendOffset(f.max_stream_data);
+                  connection_->GenerateStreamPackets();
+                  SendPendingPackets();
+                }
+              }
+            } else if constexpr (std::is_same_v<T, HandshakeDoneFrame>) {
+              if (connection_) {
+                connection_->Touch();
+                connection_->RecordReceivedPacket(pkt.packet_number);
+                if (connection_->GetState() == ConnectionState::Handshaking) {
+                  connection_->SetState(ConnectionState::Connected);
+                  internal::Log(
+                      LogSeverity::Info, "QuicClient",
+                      "Handshake confirmed via HANDSHAKE_DONE frame.");
                 }
               }
             }
@@ -3225,6 +4087,7 @@ class QuicClient {
 
   CongestionControlAlgorithm cc_algorithm_ =
       CongestionControlAlgorithm::NewReno;
+  bool auto_flow_control_ = true;
 };
 
 // ============================================================================

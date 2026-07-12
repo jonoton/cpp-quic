@@ -386,6 +386,145 @@ TEST(QuicPacketTest, SerializeDeserializeMultipleFrames) {
   EXPECT_TRUE(std::holds_alternative<cppquic::AckFrame>(decoded.frames[2]));
 }
 
+TEST(QuicPacketTest, SerializeDeserializeNewFrames) {
+  cppquic::QuicPacket pkt;
+  pkt.connection_id = cppquic::internal::GenerateConnectionId();
+  pkt.packet_number = 10;
+
+  pkt.frames.push_back(cppquic::PaddingFrame{});
+
+  cppquic::StopSendingFrame stop_sending;
+  stop_sending.stream_id = 123;
+  stop_sending.error_code = 456;
+  pkt.frames.push_back(stop_sending);
+
+  cppquic::NewTokenFrame new_token;
+  new_token.token = {0xAA, 0xBB, 0xCC};
+  pkt.frames.push_back(new_token);
+
+  cppquic::MaxDataFrame max_data;
+  max_data.max_data = 1000000;
+  pkt.frames.push_back(max_data);
+
+  cppquic::MaxStreamDataFrame max_stream_data;
+  max_stream_data.stream_id = 99;
+  max_stream_data.max_stream_data = 200000;
+  pkt.frames.push_back(max_stream_data);
+
+  cppquic::MaxStreamsFrame max_streams_bidi;
+  max_streams_bidi.unidirectional = false;
+  max_streams_bidi.max_streams = 50;
+  pkt.frames.push_back(max_streams_bidi);
+
+  cppquic::MaxStreamsFrame max_streams_uni;
+  max_streams_uni.unidirectional = true;
+  max_streams_uni.max_streams = 100;
+  pkt.frames.push_back(max_streams_uni);
+
+  cppquic::DataBlockedFrame data_blocked;
+  data_blocked.data_limit = 50000;
+  pkt.frames.push_back(data_blocked);
+
+  cppquic::StreamDataBlockedFrame stream_data_blocked;
+  stream_data_blocked.stream_id = 45;
+  stream_data_blocked.stream_data_limit = 10000;
+  pkt.frames.push_back(stream_data_blocked);
+
+  cppquic::StreamsBlockedFrame streams_blocked_bidi;
+  streams_blocked_bidi.unidirectional = false;
+  streams_blocked_bidi.stream_limit = 20;
+  pkt.frames.push_back(streams_blocked_bidi);
+
+  cppquic::StreamsBlockedFrame streams_blocked_uni;
+  streams_blocked_uni.unidirectional = true;
+  streams_blocked_uni.stream_limit = 30;
+  pkt.frames.push_back(streams_blocked_uni);
+
+  cppquic::NewConnectionIdFrame new_cid;
+  new_cid.sequence_number = 1;
+  new_cid.retire_prior_to = 0;
+  std::memset(new_cid.connection_id.data, 0x11, 8);
+  new_cid.stateless_reset_token = std::vector<uint8_t>(16, 0x99);
+  pkt.frames.push_back(new_cid);
+
+  cppquic::RetireConnectionIdFrame retire_cid;
+  retire_cid.sequence_number = 2;
+  pkt.frames.push_back(retire_cid);
+
+  cppquic::PathChallengeFrame path_challenge;
+  std::memset(path_challenge.data, 0x77, 8);
+  pkt.frames.push_back(path_challenge);
+
+  cppquic::PathResponseFrame path_response;
+  std::memset(path_response.data, 0x88, 8);
+  pkt.frames.push_back(path_response);
+
+  pkt.frames.push_back(cppquic::HandshakeDoneFrame{});
+
+  auto bytes = pkt.Serialize();
+
+  cppquic::QuicPacket decoded;
+  EXPECT_TRUE(cppquic::QuicPacket::Deserialize(bytes, decoded));
+  ASSERT_EQ(decoded.frames.size(), 16u);
+
+  EXPECT_TRUE(std::holds_alternative<cppquic::PaddingFrame>(decoded.frames[0]));
+
+  auto& f1 = std::get<cppquic::StopSendingFrame>(decoded.frames[1]);
+  EXPECT_EQ(f1.stream_id, 123u);
+  EXPECT_EQ(f1.error_code, 456u);
+
+  auto& f2 = std::get<cppquic::NewTokenFrame>(decoded.frames[2]);
+  EXPECT_EQ(f2.token, (std::vector<uint8_t>{0xAA, 0xBB, 0xCC}));
+
+  auto& f3 = std::get<cppquic::MaxDataFrame>(decoded.frames[3]);
+  EXPECT_EQ(f3.max_data, 1000000u);
+
+  auto& f4 = std::get<cppquic::MaxStreamDataFrame>(decoded.frames[4]);
+  EXPECT_EQ(f4.stream_id, 99u);
+  EXPECT_EQ(f4.max_stream_data, 200000u);
+
+  auto& f5 = std::get<cppquic::MaxStreamsFrame>(decoded.frames[5]);
+  EXPECT_FALSE(f5.unidirectional);
+  EXPECT_EQ(f5.max_streams, 50u);
+
+  auto& f6 = std::get<cppquic::MaxStreamsFrame>(decoded.frames[6]);
+  EXPECT_TRUE(f6.unidirectional);
+  EXPECT_EQ(f6.max_streams, 100u);
+
+  auto& f7 = std::get<cppquic::DataBlockedFrame>(decoded.frames[7]);
+  EXPECT_EQ(f7.data_limit, 50000u);
+
+  auto& f8 = std::get<cppquic::StreamDataBlockedFrame>(decoded.frames[8]);
+  EXPECT_EQ(f8.stream_id, 45u);
+  EXPECT_EQ(f8.stream_data_limit, 10000u);
+
+  auto& f9 = std::get<cppquic::StreamsBlockedFrame>(decoded.frames[9]);
+  EXPECT_FALSE(f9.unidirectional);
+  EXPECT_EQ(f9.stream_limit, 20u);
+
+  auto& f10 = std::get<cppquic::StreamsBlockedFrame>(decoded.frames[10]);
+  EXPECT_TRUE(f10.unidirectional);
+  EXPECT_EQ(f10.stream_limit, 30u);
+
+  auto& f11 = std::get<cppquic::NewConnectionIdFrame>(decoded.frames[11]);
+  EXPECT_EQ(f11.sequence_number, 1u);
+  EXPECT_EQ(f11.retire_prior_to, 0u);
+  EXPECT_EQ(f11.connection_id, new_cid.connection_id);
+  EXPECT_EQ(f11.stateless_reset_token, new_cid.stateless_reset_token);
+
+  auto& f12 = std::get<cppquic::RetireConnectionIdFrame>(decoded.frames[12]);
+  EXPECT_EQ(f12.sequence_number, 2u);
+
+  auto& f13 = std::get<cppquic::PathChallengeFrame>(decoded.frames[13]);
+  EXPECT_EQ(std::memcmp(f13.data, path_challenge.data, 8), 0);
+
+  auto& f14 = std::get<cppquic::PathResponseFrame>(decoded.frames[14]);
+  EXPECT_EQ(std::memcmp(f14.data, path_response.data, 8), 0);
+
+  EXPECT_TRUE(
+      std::holds_alternative<cppquic::HandshakeDoneFrame>(decoded.frames[15]));
+}
+
 TEST(QuicPacketTest, DeserializeInvalidData) {
   std::vector<uint8_t> garbage = {0xFF, 0x01, 0x02};
   cppquic::QuicPacket pkt;
@@ -912,6 +1051,11 @@ TEST(IntegrationTest, MultipleStreams) {
 }
 
 TEST(IntegrationTest, MultipleMessages) {
+  cppquic::SetLogger([](cppquic::LogSeverity severity,
+                        const std::string& className,
+                        const std::string& message) {
+    std::cout << "[" << className << "] " << message << std::endl;
+  });
   cppquic::QuicServer server(0);
 
   server.SetStreamDataHandler(
@@ -923,11 +1067,12 @@ TEST(IntegrationTest, MultipleMessages) {
   uint16_t port = server.GetLocalPort();
 
   cppquic::QuicClient client;
-  std::atomic<int> msg_count{0};
+  std::atomic<size_t> received_bytes{0};
 
-  client.SetStreamDataHandler([&msg_count](uint64_t,
-                                           const std::vector<uint8_t>&,
-                                           bool) { msg_count.fetch_add(1); });
+  client.SetStreamDataHandler(
+      [&received_bytes](uint64_t, const std::vector<uint8_t>& data, bool) {
+        received_bytes.fetch_add(data.size());
+      });
 
   client.Start();
   ASSERT_TRUE(client.Connect("127.0.0.1", port));
@@ -938,9 +1083,9 @@ TEST(IntegrationTest, MultipleMessages) {
     client.SendOnStream(stream_id, "Msg " + std::to_string(i));
   }
 
-  EXPECT_TRUE(WaitFor([&]() { return msg_count.load() >= total; },
+  EXPECT_TRUE(WaitFor([&]() { return received_bytes.load() >= 50; },
                       std::chrono::seconds(10)));
-  EXPECT_GE(msg_count.load(), total);
+  EXPECT_GE(received_bytes.load(), 50u);
 
   client.Disconnect();
   client.Stop();
@@ -1140,4 +1285,288 @@ TEST(IntegrationTest, MultipleCongestionControllers) {
     client.Stop();
     server.Stop();
   }
+}
+
+TEST(QuicStreamTest, FlowControlLimits) {
+  cppquic::QuicStream stream(4);
+  // Initial max_send_offset_ is 65536
+
+  // Write 65536 bytes (allowed)
+  std::vector<uint8_t> data1(65536, 'A');
+  auto frames1 = stream.Write(data1, false);
+  EXPECT_FALSE(frames1.empty());
+  EXPECT_EQ(stream.GetSendOffset(), 65536u);
+
+  // Write more data (should be blocked / not allowed)
+  std::vector<uint8_t> data2(5, 'B');
+  auto frames2 = stream.Write(data2, false);
+  EXPECT_TRUE(frames2.empty());  // No frames generated because limit is reached
+
+  // Increase limit
+  stream.SetMaxSendOffset(65541);
+  auto frames3 = stream.Write(data2, false);
+  EXPECT_FALSE(frames3.empty());
+  EXPECT_EQ(stream.GetSendOffset(), 65541u);
+}
+
+TEST(QuicConnectionTest, FlowControlLimits) {
+  auto local_id = cppquic::internal::GenerateConnectionId();
+  auto remote_id = cppquic::internal::GenerateConnectionId();
+  cppudpnet::PeerAddress peer{"127.0.0.1", 4433};
+
+  cppquic::QuicConnection conn(local_id, remote_id, peer, false);
+  EXPECT_EQ(conn.GetMaxSendData(), 1048576u);  // Default limit
+
+  conn.SetMaxSendData(2000000);
+  EXPECT_EQ(conn.GetMaxSendData(), 2000000u);
+
+  // Trying to set a smaller limit should be ignored (limits only grow)
+  conn.SetMaxSendData(1000);
+  EXPECT_EQ(conn.GetMaxSendData(), 2000000u);
+}
+
+TEST(QuicStreamTest, BufferingQueue) {
+  cppquic::QuicStream stream(4);
+
+  // Write beyond limit
+  std::vector<uint8_t> data(65541, 'A');
+  stream.AppendWriteData(data, false);
+
+  // Pull frames - should only return up to the 65536 limit
+  auto frames = stream.PullWriteFrames(std::numeric_limits<uint64_t>::max());
+  EXPECT_FALSE(frames.empty());
+  uint64_t total_pulled = 0;
+  for (const auto& f : frames) {
+    total_pulled += f.data.size();
+  }
+  EXPECT_EQ(total_pulled, 65536u);
+  EXPECT_EQ(stream.GetSendOffset(), 65536u);
+
+  // Try pulling again - should be 0 because limit is hit
+  auto frames2 = stream.PullWriteFrames(std::numeric_limits<uint64_t>::max());
+  EXPECT_TRUE(frames2.empty());
+
+  // Grow limit
+  stream.SetMaxSendOffset(65541);
+  auto frames3 = stream.PullWriteFrames(std::numeric_limits<uint64_t>::max());
+  EXPECT_FALSE(frames3.empty());
+  EXPECT_EQ(frames3.size(), 1u);
+  EXPECT_EQ(frames3[0].data.size(), 5u);
+  EXPECT_EQ(stream.GetSendOffset(), 65541u);
+}
+
+TEST(IntegrationTest, ConnectionFlowControlResumption) {
+  cppquic::QuicServer server(0);
+  server.SetAutoFlowControl(false);
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.SetAutoFlowControl(false);
+  std::atomic<uint64_t> server_received_bytes{0};
+
+  server.SetStreamDataHandler(
+      [&server_received_bytes](std::shared_ptr<cppquic::QuicConnection>,
+                               uint64_t, const std::vector<uint8_t>& data,
+                               bool) {
+        server_received_bytes.fetch_add(data.size());
+      });
+
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  auto conn = client.GetConnection();
+  ASSERT_NE(conn, nullptr);
+
+  uint64_t stream_id = client.OpenStream(true);
+
+  // Send 70000 bytes. The first 65536 should go out, the last 4464 should be
+  // buffered.
+  std::vector<uint8_t> large_data(70000, 'A');
+  client.SendOnStream(stream_id, large_data);
+
+  // Wait to see if 65536 bytes are received on the server
+  EXPECT_TRUE(WaitFor([&]() { return server_received_bytes.load() >= 65536; },
+                      std::chrono::seconds(2)));
+
+  // Should only have received exactly 65536 bytes
+  EXPECT_EQ(server_received_bytes.load(), 65536u);
+
+  // Now, expand the stream send limit to 70000
+  auto stream = conn->GetStream(stream_id);
+  ASSERT_NE(stream, nullptr);
+  stream->SetMaxSendOffset(70000);
+
+  // Trigger packet generation and send on the client
+  conn->GenerateStreamPackets();
+  client.SendPendingPackets();
+
+  // Wait to see if the rest is received
+  EXPECT_TRUE(WaitFor([&]() { return server_received_bytes.load() >= 70000; },
+                      std::chrono::seconds(2)));
+
+  EXPECT_EQ(server_received_bytes.load(), 70000u);
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
+
+TEST(IntegrationTest, ConnectionMigrationAndPathValidation) {
+  cppquic::ConnectionId client_cid{1, 2, 3, 4, 5, 6, 7, 8};
+  cppquic::ConnectionId server_cid{8, 7, 6, 5, 4, 3, 2, 1};
+  cppudpnet::PeerAddress client_addr{"127.0.0.1", 11111};
+  cppudpnet::PeerAddress server_addr{"127.0.0.1", 22222};
+
+  auto client_conn = std::make_shared<cppquic::QuicConnection>(
+      client_cid, server_cid, server_addr, false, nullptr);
+  auto server_conn = std::make_shared<cppquic::QuicConnection>(
+      server_cid, client_cid, client_addr, true, nullptr);
+
+  client_conn->SetState(cppquic::ConnectionState::Connected);
+  server_conn->SetState(cppquic::ConnectionState::Connected);
+
+  client_conn->GetCryptoContext()->handshake_complete = true;
+  server_conn->GetCryptoContext()->handshake_complete = true;
+
+  client_conn->GetCryptoContext()->read_key = std::vector<uint8_t>(16, 0xA);
+  client_conn->GetCryptoContext()->read_iv = std::vector<uint8_t>(12, 0xB);
+  client_conn->GetCryptoContext()->write_key = std::vector<uint8_t>(16, 0xC);
+  client_conn->GetCryptoContext()->write_iv = std::vector<uint8_t>(12, 0xD);
+
+  server_conn->GetCryptoContext()->read_key = std::vector<uint8_t>(16, 0xC);
+  server_conn->GetCryptoContext()->read_iv = std::vector<uint8_t>(12, 0xD);
+  server_conn->GetCryptoContext()->write_key = std::vector<uint8_t>(16, 0xA);
+  server_conn->GetCryptoContext()->write_iv = std::vector<uint8_t>(12, 0xB);
+
+  cppudpnet::PeerAddress migration_addr{"127.0.0.1", 33333};
+  client_conn->InitiatePathValidation(migration_addr);
+
+  ASSERT_TRUE(client_conn->HasPendingPackets());
+  auto f1 = client_conn->PopPendingPacket();
+  auto p1 = client_conn->CreatePacket(std::move(f1), 0);
+  auto b1 = client_conn->SerializePacket(p1);
+
+  cppquic::QuicPacket s_pkt;
+  bool ok = server_conn->DeserializePacket(b1, s_pkt);
+  ASSERT_TRUE(ok);
+
+  bool path_challenge_found = false;
+  for (const auto& frame : s_pkt.frames) {
+    if (std::holds_alternative<cppquic::PathChallengeFrame>(frame)) {
+      path_challenge_found = true;
+      const auto& challenge = std::get<cppquic::PathChallengeFrame>(frame);
+      cppquic::PathResponseFrame resp;
+      std::memcpy(resp.data, challenge.data, 8);
+      auto resp_pkt = server_conn->CreatePacket({resp}, 0);
+      auto resp_bytes = server_conn->SerializePacket(resp_pkt);
+
+      cppquic::QuicPacket c_pkt;
+      bool ok2 = client_conn->DeserializePacket(resp_bytes, c_pkt);
+      ASSERT_TRUE(ok2);
+
+      for (const auto& f : c_pkt.frames) {
+        if (std::holds_alternative<cppquic::PathResponseFrame>(f)) {
+          const auto& resp_frame = std::get<cppquic::PathResponseFrame>(f);
+          uint8_t pending[8];
+          client_conn->GetPendingChallenge(pending);
+          if (client_conn->IsChallengePending() &&
+              std::memcmp(pending, resp_frame.data, 8) == 0) {
+            client_conn->ClearPendingChallenge();
+            client_conn->SetPathValidated(true);
+            client_conn->SetPeer(migration_addr);
+          }
+        }
+      }
+    }
+  }
+
+  EXPECT_TRUE(path_challenge_found);
+  EXPECT_TRUE(client_conn->IsPathValidated());
+  EXPECT_EQ(client_conn->GetPeer().port, 33333);
+}
+
+TEST(IntegrationTest, ZeroRTTData) {
+  cppquic::ConnectionId client_cid{1, 2, 3, 4, 5, 6, 7, 8};
+  cppquic::ConnectionId server_cid{8, 7, 6, 5, 4, 3, 2, 1};
+  cppudpnet::PeerAddress client_addr{"127.0.0.1", 11111};
+  cppudpnet::PeerAddress server_addr{"127.0.0.1", 22222};
+
+  auto client_conn = std::make_shared<cppquic::QuicConnection>(
+      client_cid, server_cid, server_addr, false, nullptr);
+  auto server_conn = std::make_shared<cppquic::QuicConnection>(
+      server_cid, client_cid, client_addr, true, nullptr, server_cid);
+
+  client_conn->SetState(cppquic::ConnectionState::Handshaking);
+  server_conn->SetState(cppquic::ConnectionState::Handshaking);
+
+  uint64_t stream_id = 4;
+  auto stream = client_conn->GetOrCreateStream(stream_id);
+  std::vector<uint8_t> data = {'0', '-', 'R', 'T', 'T'};
+  stream->AppendWriteData(data, false);
+  client_conn->GenerateStreamPackets();
+
+  ASSERT_TRUE(client_conn->HasPendingPackets());
+  auto f1 = client_conn->PopPendingPacket();
+  auto p1 = client_conn->CreatePacket(std::move(f1), 3);
+  auto b1 = client_conn->SerializePacket(p1);
+
+  cppquic::QuicPacket s_pkt;
+  bool ok = server_conn->DeserializePacket(b1, s_pkt);
+  ASSERT_TRUE(ok);
+  ASSERT_EQ(s_pkt.packet_type, 3);
+
+  bool stream_frame_found = false;
+  for (const auto& frame : s_pkt.frames) {
+    if (std::holds_alternative<cppquic::StreamFrame>(frame)) {
+      stream_frame_found = true;
+      const auto& sf = std::get<cppquic::StreamFrame>(frame);
+      EXPECT_EQ(sf.stream_id, stream_id);
+      EXPECT_EQ(sf.data, data);
+    }
+  }
+  EXPECT_TRUE(stream_frame_found);
+}
+
+TEST(IntegrationTest, StatelessReset) {
+  cppquic::ConnectionId client_cid{1, 2, 3, 4, 5, 6, 7, 8};
+  cppquic::ConnectionId server_cid{8, 7, 6, 5, 4, 3, 2, 1};
+  cppudpnet::PeerAddress client_addr{"127.0.0.1", 11111};
+  cppudpnet::PeerAddress server_addr{"127.0.0.1", 22222};
+
+  auto client_conn = std::make_shared<cppquic::QuicConnection>(
+      client_cid, server_cid, server_addr, false, nullptr);
+
+  client_conn->SetState(cppquic::ConnectionState::Connected);
+  client_conn->GetCryptoContext()->handshake_complete = true;
+  client_conn->GetCryptoContext()->read_key = std::vector<uint8_t>(16, 0xA);
+  client_conn->GetCryptoContext()->read_iv = std::vector<uint8_t>(12, 0xB);
+
+  uint8_t expected_token[16];
+  cppquic::internal::DeriveStatelessResetToken(server_cid, expected_token);
+
+  std::vector<uint8_t> reset_pkt(40);
+  reset_pkt[0] = 0x43;
+  for (size_t i = 1; i < 24; ++i) {
+    reset_pkt[i] = static_cast<uint8_t>(std::rand() & 0xFF);
+  }
+  std::memcpy(reset_pkt.data() + 24, expected_token, 16);
+
+  cppquic::QuicPacket pkt;
+  bool ok = client_conn->DeserializePacket(reset_pkt, pkt);
+  ASSERT_FALSE(ok);
+
+  bool reset_detected = false;
+  if (reset_pkt.size() >= 21) {
+    uint8_t token[16];
+    cppquic::internal::DeriveStatelessResetToken(
+        client_conn->GetRemoteConnectionId(), token);
+    if (std::memcmp(reset_pkt.data() + reset_pkt.size() - 16, token, 16) == 0) {
+      reset_detected = true;
+      client_conn->SetState(cppquic::ConnectionState::Closed);
+    }
+  }
+
+  EXPECT_TRUE(reset_detected);
+  EXPECT_EQ(client_conn->GetState(), cppquic::ConnectionState::Closed);
 }

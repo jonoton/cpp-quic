@@ -57,6 +57,11 @@ When a datagram arrives at the server:
    - **PING** → Touch connection activity, send ACK
    - **CONNECTION_CLOSE** → Transition connection to Closed
    - **RESET_STREAM** → Reset the target stream
+   - **PATH_CHALLENGE** → Respond with a PATH_RESPONSE frame
+   - **PATH_RESPONSE** → Validate path and update active path status
+   - **STOP_SENDING** → Reset stream and send a RESET_STREAM frame
+   - **MAX_DATA** / **MAX_STREAM_DATA** → Update flow control send limits and trigger queued packet generation
+   - **HANDSHAKE_DONE** → Confirm client connection handshake completion
 
 ## Included Examples
 
