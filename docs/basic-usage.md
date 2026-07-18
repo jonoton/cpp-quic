@@ -118,6 +118,13 @@ cppquic::SetLogger([](cppquic::LogSeverity severity, const std::string& classNam
 
 ## Server Configuration
 
+### ALPN Configuration
+Configure the application-layer protocols supported by the server (default: `{"h3"}`).
+
+```cpp
+server.SetAlpnProtos({"h3", "h3-29"});
+```
+
 ### Idle Timeout
 Connections idle longer than the specified duration are automatically closed.
 

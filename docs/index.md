@@ -8,7 +8,9 @@ layout: default
 
 ### Key Features
 - **Cross-Platform:** Works natively on Windows (`Winsock2`) and Linux/macOS (`POSIX`).
-- **QUIC Protocol:** Connection IDs, multiplexed streams, packet numbering, ACKs, and retransmission.
+- **TLS 1.3 Encryption:** Mandatory TLS handshake, ALPN negotiation, transport parameters configuration, and AES-GCM (128/256-bit) packet encryption with AAD and header protection using LibreSSL (default) or OpenSSL.
+- **QUIC Protocol:** Connection IDs, multiplexed streams, packet numbering, RFC 9000 compliant ACK ranges (sparse ACKs), and retransmission.
+- **ALPN Negotiation:** Set custom application protocol identifiers (e.g., `"h3"`) on clients and servers.
 - **Multiplexed Streams:** Multiple bidirectional or unidirectional streams over a single connection.
 - **Reliable Delivery:** Packet-level ACK tracking with time-based retransmission and loss detection.
 - **Ordered Byte Streams:** Out-of-order packet reassembly ensures in-order stream data delivery.

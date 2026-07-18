@@ -770,16 +770,16 @@ TEST(QuicConnectionTest, RecordAndGenerateAck) {
 
   cppquic::QuicConnection conn(local_id, remote_id, peer, false);
 
-  conn.RecordReceivedPacket(5);
-  conn.RecordReceivedPacket(6);
-  conn.RecordReceivedPacket(7);
+  conn.RecordReceivedPacket(5, 0);
+  conn.RecordReceivedPacket(6, 0);
+  conn.RecordReceivedPacket(7, 0);
 
-  auto ack = conn.GenerateAck();
+  auto ack = conn.GenerateAck(0);
   EXPECT_EQ(ack.largest_acknowledged, 7u);
   EXPECT_EQ(ack.acknowledged_packets.size(), 3u);
 
   // Second call should return empty (already consumed)
-  auto ack2 = conn.GenerateAck();
+  auto ack2 = conn.GenerateAck(0);
   EXPECT_TRUE(ack2.acknowledged_packets.empty());
 }
 
@@ -951,11 +951,6 @@ TEST(QuicClientTest, AllowSelfSignedCertificates) {
 // ============================================================================
 
 TEST(IntegrationTest, ClientServerHandshake) {
-  cppquic::SetLogger([](cppquic::LogSeverity severity,
-                        const std::string& className,
-                        const std::string& message) {
-    std::cout << "[" << className << "] " << message << std::endl;
-  });
   cppquic::QuicServer server(0);
   server.Start();
   uint16_t port = server.GetLocalPort();
@@ -1051,11 +1046,6 @@ TEST(IntegrationTest, MultipleStreams) {
 }
 
 TEST(IntegrationTest, MultipleMessages) {
-  cppquic::SetLogger([](cppquic::LogSeverity severity,
-                        const std::string& className,
-                        const std::string& message) {
-    std::cout << "[" << className << "] " << message << std::endl;
-  });
   cppquic::QuicServer server(0);
 
   server.SetStreamDataHandler(
@@ -1640,4 +1630,41 @@ TEST(StandardQUICComplianceTest, KeylogParsing) {
   EXPECT_FALSE(crypto->handshake_read_key.empty());
   EXPECT_FALSE(crypto->handshake_read_iv.empty());
   EXPECT_FALSE(crypto->handshake_read_hp.empty());
+}
+
+TEST(StandardQUICComplianceTest, AlpnProtosSerialization) {
+  // Test empty list
+  EXPECT_TRUE(cppquic::internal::SerializeAlpnProtos({}).empty());
+
+  // Test single protocol "h3" (length prefix 2 followed by 'h', '3')
+  std::vector<uint8_t> expected_h3 = {2, 'h', '3'};
+  EXPECT_EQ(cppquic::internal::SerializeAlpnProtos({"h3"}), expected_h3);
+
+  // Test multiple protocols "h3", "http/1.1"
+  std::vector<uint8_t> expected_multiple = {2,   'h', '3', 8,   'h', 't',
+                                            't', 'p', '/', '1', '.', '1'};
+  EXPECT_EQ(cppquic::internal::SerializeAlpnProtos({"h3", "http/1.1"}),
+            expected_multiple);
+}
+
+TEST(QuicConnectionTest, TransportParametersAndAlpn) {
+  auto local_id = cppquic::internal::GenerateConnectionId();
+  auto remote_id = cppquic::internal::GenerateConnectionId();
+  cppquic::ConnectionId orig_dest_id{1, 2, 3, 4, 5, 6, 7, 8};
+  cppudpnet::PeerAddress peer{"127.0.0.1", 4433};
+  std::vector<std::string> alpn = {"h3", "h3-29"};
+
+  cppquic::QuicConnection conn(local_id, remote_id, peer, false, nullptr,
+                               orig_dest_id, alpn);
+  EXPECT_EQ(conn.GetLocalConnectionId(), local_id);
+  EXPECT_EQ(conn.GetRemoteConnectionId(), remote_id);
+  EXPECT_EQ(conn.GetOriginalDestinationConnectionId(), orig_dest_id);
+}
+
+TEST(QuicServerAndClientTest, ConfigureAlpnProtos) {
+  cppquic::QuicServer server(0);
+  EXPECT_NO_THROW(server.SetAlpnProtos({"h3", "h3-29"}));
+
+  cppquic::QuicClient client;
+  EXPECT_NO_THROW(client.SetAlpnProtos({"h3", "h3-29"}));
 }

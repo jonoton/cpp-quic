@@ -51,9 +51,9 @@ When a datagram arrives at the server:
 2. The QUIC layer deserializes the bytes into a `QuicPacket`.
 3. The packet's connection ID is used to look up the `QuicConnection`.
 4. Each frame in the packet is processed:
-   - **HANDSHAKE** → Create new connection or complete handshake
-   - **STREAM** → Deliver data to the target `QuicStream`, send ACK
-   - **ACK** → Remove acknowledged packets from the retransmission queue
+   - **CRYPTO** → Reassemble crypto fragments in order per encryption level (RFC 9000 §7.4) and feed the data into TLS to drive the handshake.
+   - **STREAM** → Deliver data to the target `QuicStream`, send ACK in the corresponding packet number space.
+   - **ACK** → Process RFC 9000-compliant ACK ranges (gaps and lengths) and remove acknowledged packets from the retransmission queue.
    - **PING** → Touch connection activity, send ACK
    - **CONNECTION_CLOSE** → Transition connection to Closed
    - **RESET_STREAM** → Reset the target stream

@@ -52,6 +52,13 @@ int main() {
 }
 ```
 
+### ALPN Configuration
+You can configure the application-layer protocols offered by the client during the TLS handshake (default: `{"h3"}`).
+
+```cpp
+client.SetAlpnProtos({"h3", "h3-29"});
+```
+
 ## Multi-Stream Transfer
 
 One of QUIC's key advantages is multiplexed streams — multiple independent byte streams within a single connection, avoiding head-of-line blocking.

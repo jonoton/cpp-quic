@@ -33,7 +33,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 4;
+constexpr int VERSION_MINOR = 5;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -88,11 +88,14 @@ inline void Log(LogSeverity severity, const std::string &className,
 inline bool EncryptData(const std::vector<uint8_t> &key,
                         const std::vector<uint8_t> &iv,
                         const std::vector<uint8_t> &plaintext,
-                        std::vector<uint8_t> &ciphertext_out) {
+                        std::vector<uint8_t> &ciphertext_out,
+                        const std::vector<uint8_t> &aad = {}) {
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
 
-  if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL)) {
+  const EVP_CIPHER *cipher =
+      (key.size() == 32) ? EVP_aes_256_gcm() : EVP_aes_128_gcm();
+  if (1 != EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL)) {
     EVP_CIPHER_CTX_free(ctx);
     return false;
   }
@@ -103,6 +106,14 @@ inline bool EncryptData(const std::vector<uint8_t> &key,
   if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, key.data(), iv.data())) {
     EVP_CIPHER_CTX_free(ctx);
     return false;
+  }
+
+  if (!aad.empty()) {
+    int outlen = 0;
+    if (1 != EVP_EncryptUpdate(ctx, NULL, &outlen, aad.data(), aad.size())) {
+      EVP_CIPHER_CTX_free(ctx);
+      return false;
+    }
   }
 
   ciphertext_out.resize(plaintext.size() + 16);
@@ -136,13 +147,16 @@ inline bool EncryptData(const std::vector<uint8_t> &key,
 inline bool DecryptData(const std::vector<uint8_t> &key,
                         const std::vector<uint8_t> &iv,
                         const std::vector<uint8_t> &ciphertext_with_tag,
-                        std::vector<uint8_t> &plaintext_out) {
+                        std::vector<uint8_t> &plaintext_out,
+                        const std::vector<uint8_t> &aad = {}) {
   if (ciphertext_with_tag.size() < 16) return false;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
 
-  if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL)) {
+  const EVP_CIPHER *cipher =
+      (key.size() == 32) ? EVP_aes_256_gcm() : EVP_aes_128_gcm();
+  if (1 != EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL)) {
     EVP_CIPHER_CTX_free(ctx);
     return false;
   }
@@ -153,6 +167,14 @@ inline bool DecryptData(const std::vector<uint8_t> &key,
   if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, key.data(), iv.data())) {
     EVP_CIPHER_CTX_free(ctx);
     return false;
+  }
+
+  if (!aad.empty()) {
+    int outlen = 0;
+    if (1 != EVP_DecryptUpdate(ctx, NULL, &outlen, aad.data(), aad.size())) {
+      EVP_CIPHER_CTX_free(ctx);
+      return false;
+    }
   }
 
   int ciphertext_len = ciphertext_with_tag.size() - 16;
@@ -267,15 +289,17 @@ inline std::vector<uint8_t> HKDF_Expand(const std::vector<uint8_t> &prk,
   okm.reserve(L);
   std::vector<uint8_t> T;
   uint8_t counter = 1;
+  const EVP_MD *md = (prk.size() == 48) ? EVP_sha384() : EVP_sha256();
+  size_t hash_len = (prk.size() == 48) ? 48 : 32;
   while (okm.size() < L) {
     std::vector<uint8_t> input = T;
     input.insert(input.end(), info.begin(), info.end());
     input.push_back(counter);
 
-    std::vector<uint8_t> tmp(32);
-    unsigned int tmp_len = 32;
-    HMAC(EVP_sha256(), prk.data(), prk.size(), input.data(), input.size(),
-         tmp.data(), &tmp_len);
+    std::vector<uint8_t> tmp(hash_len);
+    unsigned int tmp_len = hash_len;
+    HMAC(md, prk.data(), prk.size(), input.data(), input.size(), tmp.data(),
+         &tmp_len);
     tmp.resize(tmp_len);
 
     size_t remaining = L - okm.size();
@@ -291,6 +315,20 @@ inline std::vector<uint8_t> HKDF_Expand_Label(
     const std::vector<uint8_t> &secret, const std::string &label,
     const std::vector<uint8_t> &context, size_t length) {
   std::string full_label = "tls13 " + label;
+  std::vector<uint8_t> hkdf_label;
+  hkdf_label.push_back(static_cast<uint8_t>((length >> 8) & 0xFF));
+  hkdf_label.push_back(static_cast<uint8_t>(length & 0xFF));
+  hkdf_label.push_back(static_cast<uint8_t>(full_label.size()));
+  hkdf_label.insert(hkdf_label.end(), full_label.begin(), full_label.end());
+  hkdf_label.push_back(static_cast<uint8_t>(context.size()));
+  hkdf_label.insert(hkdf_label.end(), context.begin(), context.end());
+  return HKDF_Expand(secret, hkdf_label, length);
+}
+
+inline std::vector<uint8_t> HKDF_Expand_Label_QUIC(
+    const std::vector<uint8_t> &secret, const std::string &label,
+    const std::vector<uint8_t> &context, size_t length) {
+  std::string full_label = "tls13 quic " + label;
   std::vector<uint8_t> hkdf_label;
   hkdf_label.push_back(static_cast<uint8_t>((length >> 8) & 0xFF));
   hkdf_label.push_back(static_cast<uint8_t>(length & 0xFF));
@@ -325,8 +363,10 @@ inline bool ComputeHPMask(const std::vector<uint8_t> &hp_key,
   if (hp_key.size() < 16) return false;
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
-  if (1 !=
-      EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, hp_key.data(), NULL)) {
+
+  const EVP_CIPHER *cipher =
+      (hp_key.size() == 32) ? EVP_aes_256_ecb() : EVP_aes_128_ecb();
+  if (1 != EVP_EncryptInit_ex(ctx, cipher, NULL, hp_key.data(), NULL)) {
     EVP_CIPHER_CTX_free(ctx);
     return false;
   }
@@ -871,9 +911,39 @@ inline void SerializeFrame(std::vector<uint8_t> &buf, const QuicFrame &frame) {
           WriteVarInt(buf, static_cast<uint64_t>(FrameType::ACK));
           WriteVarInt(buf, f.largest_acknowledged);
           WriteVarInt(buf, f.ack_delay_us);
-          WriteVarInt(buf, f.acknowledged_packets.size());
-          for (auto pkt : f.acknowledged_packets) {
-            WriteVarInt(buf, pkt);
+
+          std::vector<uint64_t> pkts = f.acknowledged_packets;
+          std::sort(pkts.begin(), pkts.end(), std::greater<uint64_t>());
+
+          uint64_t first_ack_range = 0;
+          size_t idx = 1;
+          while (idx < pkts.size() && pkts[idx] == pkts[idx - 1] - 1) {
+            first_ack_range++;
+            idx++;
+          }
+
+          struct AckRange {
+            uint64_t gap;
+            uint64_t length;
+          };
+          std::vector<AckRange> ranges;
+
+          while (idx < pkts.size()) {
+            uint64_t gap = (pkts[idx - 1] - pkts[idx]) - 2;
+            uint64_t length = 0;
+            idx++;
+            while (idx < pkts.size() && pkts[idx] == pkts[idx - 1] - 1) {
+              length++;
+              idx++;
+            }
+            ranges.push_back({gap, length});
+          }
+
+          WriteVarInt(buf, ranges.size());
+          WriteVarInt(buf, first_ack_range);
+          for (const auto &r : ranges) {
+            WriteVarInt(buf, r.gap);
+            WriteVarInt(buf, r.length);
           }
 
         } else if constexpr (std::is_same_v<T, CryptoFrame>) {
@@ -1018,13 +1088,37 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       AckFrame f;
       if (!ReadVarInt(buf, len, offset, f.largest_acknowledged)) return false;
       if (!ReadVarInt(buf, len, offset, f.ack_delay_us)) return false;
-      uint64_t count = 0;
-      if (!ReadVarInt(buf, len, offset, count)) return false;
-      f.acknowledged_packets.resize(count);
-      for (uint64_t i = 0; i < count; ++i) {
-        if (!ReadVarInt(buf, len, offset, f.acknowledged_packets[i]))
-          return false;
+
+      uint64_t ack_range_count = 0;
+      if (!ReadVarInt(buf, len, offset, ack_range_count)) return false;
+
+      uint64_t first_ack_range = 0;
+      if (!ReadVarInt(buf, len, offset, first_ack_range)) return false;
+
+      if (f.largest_acknowledged < first_ack_range) return false;
+
+      uint64_t current_packet = f.largest_acknowledged;
+      for (uint64_t i = 0; i <= first_ack_range; ++i) {
+        f.acknowledged_packets.push_back(current_packet - i);
       }
+      current_packet = current_packet - first_ack_range;
+
+      for (uint64_t i = 0; i < ack_range_count; ++i) {
+        uint64_t gap = 0;
+        uint64_t length = 0;
+        if (!ReadVarInt(buf, len, offset, gap)) return false;
+        if (!ReadVarInt(buf, len, offset, length)) return false;
+
+        if (current_packet < gap + 2) return false;
+        current_packet = current_packet - gap - 2;
+
+        if (current_packet < length) return false;
+        for (uint64_t j = 0; j <= length; ++j) {
+          f.acknowledged_packets.push_back(current_packet - j);
+        }
+        current_packet = current_packet - length;
+      }
+
       out = std::move(f);
       return true;
     }
@@ -1174,7 +1268,31 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
 /**
  * @brief A QUIC packet containing a connection ID, packet number, and frames.
  */
+class QuicConnection;
+
 namespace internal {
+int quic_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                         const SSL_CIPHER *cipher, const uint8_t *secret,
+                         size_t secret_len);
+int quic_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                          const SSL_CIPHER *cipher, const uint8_t *secret,
+                          size_t secret_len);
+int quic_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level,
+                            const uint8_t *data, size_t len);
+int quic_flush_flight(SSL *ssl);
+int quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t alert);
+
+extern const SSL_QUIC_METHOD quic_method;
+
+std::vector<uint8_t> SerializeAlpnProtos(
+    const std::vector<std::string> &protos);
+
+int QuicAlpnSelectCallback(SSL *ssl, const unsigned char **out,
+                           unsigned char *outlen, const unsigned char *in,
+                           unsigned int inlen, void *arg);
+
+void SetQuicTransportParams(SSL *ssl);
+
 inline SSL_CTX *GetSSLContext(bool is_server) {
   static std::mutex mtx;
   std::lock_guard<std::mutex> lock(mtx);
@@ -1192,6 +1310,9 @@ inline SSL_CTX *GetSSLContext(bool is_server) {
       server_ctx = SSL_CTX_new(TLS_server_method());
       SSL_CTX_set_min_proto_version(server_ctx, TLS1_3_VERSION);
       SSL_CTX_set_keylog_callback(server_ctx, QuicKeylogCallback);
+      SSL_CTX_set_quic_method(server_ctx, &quic_method);
+      SSL_CTX_set_dh_auto(server_ctx, 1);
+      SSL_CTX_set_alpn_select_cb(server_ctx, QuicAlpnSelectCallback, nullptr);
       if (!GenerateSelfSignedCert(server_ctx)) {
         Log(LogSeverity::Error, "GetSSLContext",
             "Failed to generate self-signed certificate");
@@ -1203,6 +1324,7 @@ inline SSL_CTX *GetSSLContext(bool is_server) {
       client_ctx = SSL_CTX_new(TLS_client_method());
       SSL_CTX_set_min_proto_version(client_ctx, TLS1_3_VERSION);
       SSL_CTX_set_keylog_callback(client_ctx, QuicKeylogCallback);
+      SSL_CTX_set_quic_method(client_ctx, &quic_method);
     }
     return client_ctx;
   }
@@ -1246,20 +1368,7 @@ inline void DeriveInitialKeys(const ConnectionId &dest_conn_id, bool is_server,
 
   Log(LogSeverity::Info, "DeriveKeys",
       std::string(is_server ? "Server" : "Client") +
-          " derived initial keys for dest_conn_id " + dest_conn_id.ToHex() +
-          ": read_key=" +
-          (read_key.empty() ? ""
-                            : ConnectionId{read_key[0], read_key[1],
-                                           read_key[2], read_key[3], 0, 0, 0, 0}
-                                  .ToHex()
-                                  .substr(0, 8)) +
-          ", write_key=" +
-          (write_key.empty()
-               ? ""
-               : ConnectionId{write_key[0], write_key[1], write_key[2],
-                              write_key[3], 0, 0, 0, 0}
-                     .ToHex()
-                     .substr(0, 8)));
+          " derived initial keys successfully.");
 }
 
 inline void DeriveZeroRTTKeys(const ConnectionId &dest_conn_id, bool is_server,
@@ -1327,23 +1436,9 @@ struct QuicPacket {
       internal::SerializeFrame(payload, frame);
     }
 
-    std::vector<uint8_t> final_payload;
-    if (key && iv && !key->empty() && !iv->empty()) {
-      std::vector<uint8_t> pkt_iv = *iv;
-      for (size_t i = 0; i < 8 && i < pkt_iv.size(); ++i) {
-        pkt_iv[pkt_iv.size() - 1 - i] ^= (packet_number >> (i * 8)) & 0xFF;
-      }
-      std::vector<uint8_t> ciphertext;
-      if (internal::EncryptData(*key, pkt_iv, payload, ciphertext)) {
-        final_payload = std::move(ciphertext);
-      } else {
-        final_payload = std::move(payload);  // fallback
-      }
-    } else {
-      final_payload = std::move(payload);
-    }
-
     bool is_long = (packet_type == 1 || packet_type == 2 || packet_type == 3);
+    size_t pn_offset = 0;
+
     if (is_long) {
       // Long Header (Initial, Handshake, or 0-RTT)
       uint8_t first = 0;
@@ -1365,44 +1460,43 @@ struct QuicPacket {
         internal::WriteVarInt(buf, 0);  // Token Len
       }
 
-      // Length = Packet Number size (4 bytes) + final_payload size
-      uint64_t packet_len = 4 + final_payload.size();
+      // Length = Packet Number size (4 bytes) + payload size + 16 (tag size)
+      uint64_t packet_len = 4 + payload.size() + (key ? 16 : 0);
       internal::WriteVarInt(buf, packet_len);
 
+      pn_offset = buf.size();
       internal::WriteUint32(buf, static_cast<uint32_t>(packet_number));
-      buf.insert(buf.end(), final_payload.begin(), final_payload.end());
     } else {
       // Short Header (1-RTT)
       internal::WriteUint8(buf, 0x43);
       connection_id.Serialize(buf);
+      pn_offset = buf.size();
       internal::WriteUint32(buf, static_cast<uint32_t>(packet_number));
-      buf.insert(buf.end(), final_payload.begin(), final_payload.end());
     }
+
+    std::vector<uint8_t> final_payload;
+    if (key && iv && !key->empty() && !iv->empty()) {
+      std::vector<uint8_t> pkt_iv = *iv;
+      for (size_t i = 0; i < 8 && i < pkt_iv.size(); ++i) {
+        pkt_iv[pkt_iv.size() - 1 - i] ^= (packet_number >> (i * 8)) & 0xFF;
+      }
+      std::vector<uint8_t> ciphertext;
+      if (internal::EncryptData(*key, pkt_iv, payload, ciphertext, buf)) {
+        final_payload = std::move(ciphertext);
+      } else {
+        internal::Log(
+            LogSeverity::Error, "QuicPacket",
+            "Encryption failed for packet type " + std::to_string(packet_type));
+        final_payload = std::move(payload);  // fallback
+      }
+    } else {
+      final_payload = std::move(payload);
+    }
+
+    buf.insert(buf.end(), final_payload.begin(), final_payload.end());
 
     // Apply Header Protection (HP) masking
     if (hp && !hp->empty()) {
-      size_t pn_offset = 0;
-      if (is_long) {
-        pn_offset =
-            1 + 4 + 1 + connection_id.length + 1 + source_connection_id.length;
-        if (packet_type == 1) {
-          pn_offset += 1;  // token_len (varint 0 is 1 byte)
-        }
-        uint64_t packet_len = 4 + final_payload.size();
-        size_t len_varint_size = 1;
-        if (packet_len <= 63)
-          len_varint_size = 1;
-        else if (packet_len <= 16383)
-          len_varint_size = 2;
-        else if (packet_len <= 1073741823)
-          len_varint_size = 4;
-        else
-          len_varint_size = 8;
-        pn_offset += len_varint_size;
-      } else {
-        pn_offset = 1 + connection_id.length;
-      }
-
       size_t sample_offset = pn_offset + 4;
       if (buf.size() >= sample_offset + 16) {
         uint8_t mask[16];
@@ -1550,8 +1644,13 @@ struct QuicPacket {
     if (hp && !hp->empty() && len >= sample_offset + 16) {
       uint8_t mask[16];
       if (internal::ComputeHPMask(*hp, dec_buf + sample_offset, mask)) {
-        dec_buf[0] ^= (mask[0] & (is_long ? 0x0f : 0x1f));
-        for (size_t i = 0; i < 4; ++i) {
+        // Print detailed HP debug info
+
+        uint8_t decrypted_first =
+            raw_first ^ (mask[0] & (is_long ? 0x0f : 0x1f));
+        dec_buf[0] = decrypted_first;
+        uint8_t pn_len = (decrypted_first & 0x03) + 1;
+        for (size_t i = 0; i < pn_len && pn_offset + i < len; ++i) {
           dec_buf[pn_offset + i] ^= mask[1 + i];
         }
       }
@@ -1604,15 +1703,19 @@ struct QuicPacket {
       if (!internal::ReadVarInt(dec_buf, len, offset, packet_len)) return false;
       if (offset + packet_len > len) return false;
 
+      uint8_t pn_len = (first & 0x03) + 1;
       uint32_t pkt_num = 0;
-      if (!internal::ReadUint32(dec_buf, len, offset, pkt_num)) return false;
+      for (size_t i = 0; i < pn_len; ++i) {
+        pkt_num = (pkt_num << 8) | dec_buf[offset++];
+      }
       out.packet_number = pkt_num;
 
-      size_t payload_len = packet_len - 4;
+      size_t payload_len = packet_len - pn_len;
       if (offset + payload_len > len) return false;
 
       std::vector<uint8_t> payload_buf(dec_buf + offset,
                                        dec_buf + offset + payload_len);
+      size_t AAD_offset = offset;
       offset += payload_len;
 
       std::vector<uint8_t> plaintext;
@@ -1622,7 +1725,11 @@ struct QuicPacket {
           pkt_iv[pkt_iv.size() - 1 - i] ^=
               (out.packet_number >> (i * 8)) & 0xFF;
         }
-        if (!internal::DecryptData(*key, pkt_iv, payload_buf, plaintext)) {
+        std::vector<uint8_t> aad(dec_buf, dec_buf + AAD_offset);
+        if (!internal::DecryptData(*key, pkt_iv, payload_buf, plaintext, aad)) {
+          internal::Log(LogSeverity::Warn, "QuicPacket",
+                        "Decryption failed for packet type " +
+                            std::to_string(out.packet_type));
           return false;
         }
       } else {
@@ -1648,11 +1755,15 @@ struct QuicPacket {
                                      expected_conn_id_len))
         return false;
 
+      uint8_t pn_len = (first & 0x03) + 1;
       uint32_t pkt_num = 0;
-      if (!internal::ReadUint32(dec_buf, len, offset, pkt_num)) return false;
+      for (size_t i = 0; i < pn_len; ++i) {
+        pkt_num = (pkt_num << 8) | dec_buf[offset++];
+      }
       out.packet_number = pkt_num;
 
       std::vector<uint8_t> payload_buf(dec_buf + offset, dec_buf + len);
+      size_t AAD_offset = offset;
       offset = len;
 
       std::vector<uint8_t> plaintext;
@@ -1662,7 +1773,10 @@ struct QuicPacket {
           pkt_iv[pkt_iv.size() - 1 - i] ^=
               (out.packet_number >> (i * 8)) & 0xFF;
         }
-        if (!internal::DecryptData(*key, pkt_iv, payload_buf, plaintext)) {
+        std::vector<uint8_t> aad(dec_buf, dec_buf + AAD_offset);
+        if (!internal::DecryptData(*key, pkt_iv, payload_buf, plaintext, aad)) {
+          internal::Log(LogSeverity::Warn, "QuicPacket",
+                        "Decryption failed for short header packet");
           return false;
         }
       } else {
@@ -2347,20 +2461,22 @@ class QuicConnection {
   QuicConnection(const ConnectionId &local_id, const ConnectionId &remote_id,
                  const cppudpnet::PeerAddress &peer, bool is_server,
                  SSL_CTX *custom_ctx = nullptr,
-                 const ConnectionId &original_dest_id = ConnectionId{})
+                 const ConnectionId &original_dest_id = ConnectionId{},
+                 const std::vector<std::string> &alpn_protos = {"h3"})
       : local_connection_id_(local_id),
         remote_connection_id_(remote_id),
         peer_(peer),
-        is_server_(is_server) {
+        is_server_(is_server),
+        original_destination_connection_id_(original_dest_id) {
     crypto_ctx_ = std::make_shared<QuicCryptoContext>();
     SSL_CTX *ctx = custom_ctx ? custom_ctx : internal::GetSSLContext(is_server);
     crypto_ctx_->ssl = SSL_new(ctx);
-    crypto_ctx_->rbio = BIO_new(BIO_s_mem());
-    crypto_ctx_->wbio = BIO_new(BIO_s_mem());
-    SSL_set_bio(crypto_ctx_->ssl, crypto_ctx_->rbio, crypto_ctx_->wbio);
     SSL_set_app_data(crypto_ctx_->ssl, this);
-    if (custom_ctx) {
-      SSL_CTX_set_keylog_callback(custom_ctx, internal::QuicKeylogCallback);
+    internal::SetQuicTransportParams(crypto_ctx_->ssl);
+    if (!is_server) {
+      std::vector<uint8_t> alpn_wire =
+          internal::SerializeAlpnProtos(alpn_protos);
+      SSL_set_alpn_protos(crypto_ctx_->ssl, alpn_wire.data(), alpn_wire.size());
     }
     if (is_server) {
       SSL_set_accept_state(crypto_ctx_->ssl);
@@ -2407,76 +2523,92 @@ class QuicConnection {
 
     if (type == "CLIENT_HANDSHAKE_TRAFFIC_SECRET") {
       std::vector<uint8_t> secret = internal::HexToBytes(secret_hex);
+      size_t key_len = (secret.size() == 48) ? 32 : 16;
+      size_t hp_len = (secret.size() == 48) ? 32 : 16;
       if (is_server_) {
         crypto_ctx_->handshake_read_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->handshake_read_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->handshake_read_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       } else {
         crypto_ctx_->handshake_write_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->handshake_write_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->handshake_write_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       }
     } else if (type == "SERVER_HANDSHAKE_TRAFFIC_SECRET") {
       std::vector<uint8_t> secret = internal::HexToBytes(secret_hex);
+      size_t key_len = (secret.size() == 48) ? 32 : 16;
+      size_t hp_len = (secret.size() == 48) ? 32 : 16;
       if (is_server_) {
         crypto_ctx_->handshake_write_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->handshake_write_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->handshake_write_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       } else {
         crypto_ctx_->handshake_read_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->handshake_read_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->handshake_read_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       }
     } else if (type == "CLIENT_TRAFFIC_SECRET_0") {
       std::vector<uint8_t> secret = internal::HexToBytes(secret_hex);
+      size_t key_len = (secret.size() == 48) ? 32 : 16;
+      size_t hp_len = (secret.size() == 48) ? 32 : 16;
       if (is_server_) {
         crypto_ctx_->read_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->read_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->read_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       } else {
         crypto_ctx_->write_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->write_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->write_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       }
     } else if (type == "SERVER_TRAFFIC_SECRET_0") {
       std::vector<uint8_t> secret = internal::HexToBytes(secret_hex);
+      size_t key_len = (secret.size() == 48) ? 32 : 16;
+      size_t hp_len = (secret.size() == 48) ? 32 : 16;
       if (is_server_) {
         crypto_ctx_->write_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->write_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->write_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       } else {
         crypto_ctx_->read_key =
-            internal::HKDF_Expand_Label(secret, "quic key", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "key", {}, key_len);
         crypto_ctx_->read_iv =
-            internal::HKDF_Expand_Label(secret, "quic iv", {}, 12);
+            internal::HKDF_Expand_Label_QUIC(secret, "iv", {}, 12);
         crypto_ctx_->read_hp =
-            internal::HKDF_Expand_Label(secret, "quic hp", {}, 16);
+            internal::HKDF_Expand_Label_QUIC(secret, "hp", {}, hp_len);
       }
     }
   }
+  void AppendPendingHandshakeData(int level, const uint8_t *data, size_t len) {
+    auto &buf = pending_handshake_data_[level];
+    buf.insert(buf.end(), data, data + len);
+  }
 
   ConnectionId GetLocalConnectionId() const { return local_connection_id_; }
+  bool IsServer() const { return is_server_; }
+  const ConnectionId &GetOriginalDestinationConnectionId() const {
+    return original_destination_connection_id_;
+  }
   ConnectionId GetRemoteConnectionId() const { return remote_connection_id_; }
   void SetRemoteConnectionId(const ConnectionId &id) {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -2603,9 +2735,8 @@ class QuicConnection {
   /**
    * @brief Creates a QUIC packet from frames and assigns a packet number.
    */
-  QuicPacket CreatePacket(std::vector<QuicFrame> frames,
-                          uint8_t packet_type = 0) {
-    std::lock_guard<std::mutex> lock(mtx_);
+  QuicPacket CreatePacketLocked(std::vector<QuicFrame> frames,
+                                uint8_t packet_type = 0) {
     QuicPacket pkt;
     pkt.packet_type = packet_type;
     pkt.connection_id = remote_connection_id_;
@@ -2637,6 +2768,12 @@ class QuicConnection {
     }
 
     return pkt;
+  }
+
+  QuicPacket CreatePacket(std::vector<QuicFrame> frames,
+                          uint8_t packet_type = 0) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return CreatePacketLocked(std::move(frames), packet_type);
   }
 
   /**
@@ -2725,15 +2862,13 @@ class QuicConnection {
         read_iv = &crypto_ctx_->initial_read_iv;
         read_hp = &crypto_ctx_->initial_read_hp;
       } else if (packet_type == 2) {
-        read_key = crypto_ctx_->handshake_read_key.empty()
-                       ? &crypto_ctx_->initial_read_key
-                       : &crypto_ctx_->handshake_read_key;
-        read_iv = crypto_ctx_->handshake_read_iv.empty()
-                      ? &crypto_ctx_->initial_read_iv
-                      : &crypto_ctx_->handshake_read_iv;
-        read_hp = crypto_ctx_->handshake_read_hp.empty()
-                      ? &crypto_ctx_->initial_read_hp
-                      : &crypto_ctx_->handshake_read_hp;
+        bool hs_empty = crypto_ctx_->handshake_read_key.empty();
+        read_key = hs_empty ? &crypto_ctx_->initial_read_key
+                            : &crypto_ctx_->handshake_read_key;
+        read_iv = hs_empty ? &crypto_ctx_->initial_read_iv
+                           : &crypto_ctx_->handshake_read_iv;
+        read_hp = hs_empty ? &crypto_ctx_->initial_read_hp
+                           : &crypto_ctx_->handshake_read_hp;
       } else if (packet_type == 3) {
         read_key = &crypto_ctx_->zerortt_read_key;
         read_iv = &crypto_ctx_->zerortt_read_iv;
@@ -2755,28 +2890,119 @@ class QuicConnection {
                                    expected_len);
   }
 
-  void ProcessCrypto(const std::vector<uint8_t> &in_data,
-                     std::vector<uint8_t> &out_data) {
+  // Called for each received CryptoFrame. Performs in-order stream reassembly
+  // per encryption level before feeding data to the TLS layer (RFC 9000 §7.4).
+  std::vector<QuicPacket> ProcessCrypto(uint64_t frame_offset,
+                                        const std::vector<uint8_t> &in_data,
+                                        int ssl_level = 0) {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!crypto_ctx_ || crypto_ctx_->handshake_complete) return;
+    std::vector<QuicPacket> pkts;
+    if (!crypto_ctx_ || crypto_ctx_->handshake_complete) return pkts;
 
+    // --- CRYPTO stream reassembly (RFC 9000 §7.4) ---
     if (!in_data.empty()) {
-      BIO_write(crypto_ctx_->rbio, in_data.data(), in_data.size());
+      // Store the incoming fragment under the expected ssl_level key
+      auto &ooo = crypto_rx_ooo_[ssl_level];
+      ooo[frame_offset] = in_data;
+
+      // Deliver as many contiguous bytes as possible to the TLS layer.
+      // Always use SSL_quic_read_level() for SSL_provide_quic_data — it
+      // reflects the level LibreSSL currently expects, which may differ from
+      // the packet's ssl_level once the handshake progresses.
+      auto &next = crypto_rx_next_offset_[ssl_level];
+      while (true) {
+        auto it = ooo.find(next);
+        if (it == ooo.end()) break;  // Gap – wait for missing fragment
+
+        const auto &frag = it->second;
+        enum ssl_encryption_level_t current_level =
+            SSL_quic_read_level(crypto_ctx_->ssl);
+        int prov_ret = SSL_provide_quic_data(crypto_ctx_->ssl, current_level,
+                                             frag.data(), frag.size());
+        if (prov_ret <= 0) {
+          char err_buf[256];
+          ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+          internal::Log(
+              LogSeverity::Error, "ProcessCrypto",
+              std::string("SSL_provide_quic_data failed: ") + err_buf);
+          break;  // Stop feeding if rejected
+        }
+        next += frag.size();
+        ooo.erase(it);
+      }
     }
 
-    int ret = SSL_do_handshake(crypto_ctx_->ssl);
+    pending_handshake_data_.clear();
 
-    char buf[4096];
-    while (true) {
-      int bytes_read = BIO_read(crypto_ctx_->wbio, buf, sizeof(buf));
-      if (bytes_read <= 0) break;
-      out_data.insert(out_data.end(), buf, buf + bytes_read);
+    int ret = SSL_do_handshake(crypto_ctx_->ssl);
+    if (ret <= 0) {
+      int err = SSL_get_error(crypto_ctx_->ssl, ret);
+      if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+        char err_buf[256];
+        const char *file = nullptr;
+        int line = 0;
+        unsigned long e;
+        while ((e = ERR_get_error_line(&file, &line)) != 0) {
+          ERR_error_string_n(e, err_buf, sizeof(err_buf));
+          internal::Log(LogSeverity::Error, "ProcessCrypto",
+                        std::string("TLS handshake error: ") + err_buf);
+        }
+      }
+    }
+
+    // Level 0 (Initial) -> Initial packet (type 1)
+    if (pending_handshake_data_.count(0) &&
+        !pending_handshake_data_[0].empty()) {
+      const auto &data = pending_handshake_data_[0];
+      size_t offset = 0;
+      while (offset < data.size()) {
+        size_t chunk_size =
+            std::min(data.size() - offset, static_cast<size_t>(900));
+        CryptoFrame cf;
+        cf.offset = offset;
+        cf.data = std::vector<uint8_t>(data.begin() + offset,
+                                       data.begin() + offset + chunk_size);
+        std::vector<QuicFrame> frames;
+        if (offset == 0) {
+          auto ack = GenerateAckLocked(1);
+          if (!ack.acknowledged_packets.empty()) {
+            frames.push_back(std::move(ack));
+          }
+        }
+        frames.push_back(std::move(cf));
+        pkts.push_back(CreatePacketLocked(std::move(frames), 1));
+        offset += chunk_size;
+      }
+    }
+    // Level 2 (Handshake) -> Handshake packet (type 2)
+    if (pending_handshake_data_.count(2) &&
+        !pending_handshake_data_[2].empty()) {
+      const auto &data = pending_handshake_data_[2];
+      size_t offset = 0;
+      while (offset < data.size()) {
+        size_t chunk_size =
+            std::min(data.size() - offset, static_cast<size_t>(900));
+        CryptoFrame cf;
+        cf.offset = offset;
+        cf.data = std::vector<uint8_t>(data.begin() + offset,
+                                       data.begin() + offset + chunk_size);
+        std::vector<QuicFrame> frames;
+        if (offset == 0) {
+          auto ack = GenerateAckLocked(2);
+          if (!ack.acknowledged_packets.empty()) {
+            frames.push_back(std::move(ack));
+          }
+        }
+        frames.push_back(std::move(cf));
+        pkts.push_back(CreatePacketLocked(std::move(frames), 2));
+        offset += chunk_size;
+      }
     }
 
     if (ret == 1) {
       crypto_ctx_->handshake_complete = true;
-      ExtractKeys();
     }
+    return pkts;
   }
 
   void ExtractKeys() {
@@ -2846,26 +3072,35 @@ class QuicConnection {
   /**
    * @brief Records that a packet was received (for ACK generation).
    */
-  void RecordReceivedPacket(uint64_t packet_number) {
+  void RecordReceivedPacket(uint64_t packet_number, uint8_t packet_type) {
     std::lock_guard<std::mutex> lock(mtx_);
-    received_packets_.push_back(packet_number);
-    if (packet_number > largest_received_packet_) {
-      largest_received_packet_ = packet_number;
+    if (packet_type > 3) return;
+    received_packets_[packet_type].push_back(packet_number);
+    if (packet_number > largest_received_packet_[packet_type]) {
+      largest_received_packet_[packet_type] = packet_number;
     }
+  }
+
+  /**
+   * @brief Generates an ACK frame for received packets (locked context).
+   */
+  AckFrame GenerateAckLocked(uint8_t packet_type) {
+    AckFrame ack;
+    if (packet_type > 3) return ack;
+    ack.largest_acknowledged = largest_received_packet_[packet_type];
+    ack.ack_delay_us = 0;
+    ack.acknowledged_packets = received_packets_[packet_type];
+    received_packets_[packet_type].clear();
+    return ack;
   }
 
   /**
    * @brief Generates an ACK frame for received packets.
    * @return An AckFrame acknowledging all unacknowledged received packets.
    */
-  AckFrame GenerateAck() {
+  AckFrame GenerateAck(uint8_t packet_type) {
     std::lock_guard<std::mutex> lock(mtx_);
-    AckFrame ack;
-    ack.largest_acknowledged = largest_received_packet_;
-    ack.ack_delay_us = 0;
-    ack.acknowledged_packets = received_packets_;
-    received_packets_.clear();
-    return ack;
+    return GenerateAckLocked(packet_type);
   }
 
   /**
@@ -3161,6 +3396,7 @@ class QuicConnection {
 
   ConnectionId local_connection_id_;
   ConnectionId remote_connection_id_;
+  ConnectionId original_destination_connection_id_;
   cppudpnet::PeerAddress peer_;
   bool path_validated_ = true;
   cppudpnet::PeerAddress candidate_peer_;
@@ -3185,9 +3421,9 @@ class QuicConnection {
   // Sent packet tracking for retransmission
   std::map<uint64_t, SentPacketInfo> sent_packets_;
 
-  // Received packet tracking for ACK generation
-  std::vector<uint64_t> received_packets_;
-  uint64_t largest_received_packet_ = 0;
+  // Received packet tracking for ACK generation per packet number space
+  std::vector<uint64_t> received_packets_[4];
+  uint64_t largest_received_packet_[4] = {0, 0, 0, 0};
 
   // Stats
   uint64_t bytes_sent_ = 0;
@@ -3204,15 +3440,189 @@ class QuicConnection {
 
   std::unique_ptr<CongestionController> congestion_controller_;
   std::deque<std::vector<QuicFrame>> pending_packets_;
+  std::map<int, std::vector<uint8_t>> pending_handshake_data_;
+
+  // CRYPTO stream reassembly per encryption level (RFC 9000 §7.4)
+  // Maps level -> next byte offset we expect to deliver to TLS
+  std::map<int, uint64_t> crypto_rx_next_offset_;
+  // Out-of-order fragments: level -> map<offset, data>
+  std::map<int, std::map<uint64_t, std::vector<uint8_t>>> crypto_rx_ooo_;
 };
 
 namespace internal {
+
+inline void DeriveQuicKeys(const uint8_t *secret, size_t secret_len,
+                           std::vector<uint8_t> &key, std::vector<uint8_t> &iv,
+                           std::vector<uint8_t> &hp) {
+  std::vector<uint8_t> secret_vec(secret, secret + secret_len);
+  size_t key_len = (secret_len == 48) ? 32 : 16;
+  size_t hp_len = (secret_len == 48) ? 32 : 16;
+  key = HKDF_Expand_Label_QUIC(secret_vec, "key", {}, key_len);
+  iv = HKDF_Expand_Label_QUIC(secret_vec, "iv", {}, 12);
+  hp = HKDF_Expand_Label_QUIC(secret_vec, "hp", {}, hp_len);
+}
+
+inline int quic_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                                const SSL_CIPHER *cipher, const uint8_t *secret,
+                                size_t secret_len) {
+  auto *conn = static_cast<::cppquic::QuicConnection *>(SSL_get_app_data(ssl));
+  if (!conn) return 0;
+
+  auto crypto_ctx = conn->GetCryptoContext();
+  if (!crypto_ctx) return 0;
+
+  std::vector<uint8_t> key, iv, hp;
+  DeriveQuicKeys(secret, secret_len, key, iv, hp);
+
+  if (level == ssl_encryption_handshake) {
+    crypto_ctx->handshake_read_key = key;
+    crypto_ctx->handshake_read_iv = iv;
+    crypto_ctx->handshake_read_hp = hp;
+  } else if (level == ssl_encryption_application) {
+    crypto_ctx->read_key = key;
+    crypto_ctx->read_iv = iv;
+    crypto_ctx->read_hp = hp;
+  }
+  return 1;
+}
+
+inline int quic_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                                 const SSL_CIPHER *cipher,
+                                 const uint8_t *secret, size_t secret_len) {
+  auto *conn = static_cast<::cppquic::QuicConnection *>(SSL_get_app_data(ssl));
+  if (!conn) return 0;
+
+  auto crypto_ctx = conn->GetCryptoContext();
+  if (!crypto_ctx) return 0;
+
+  std::vector<uint8_t> key, iv, hp;
+  DeriveQuicKeys(secret, secret_len, key, iv, hp);
+
+  if (level == ssl_encryption_handshake) {
+    crypto_ctx->handshake_write_key = key;
+    crypto_ctx->handshake_write_iv = iv;
+    crypto_ctx->handshake_write_hp = hp;
+  } else if (level == ssl_encryption_application) {
+    crypto_ctx->write_key = key;
+    crypto_ctx->write_iv = iv;
+    crypto_ctx->write_hp = hp;
+  }
+  return 1;
+}
+
+inline int quic_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level,
+                                   const uint8_t *data, size_t len) {
+  auto *conn = static_cast<::cppquic::QuicConnection *>(SSL_get_app_data(ssl));
+  if (!conn) return 0;
+  conn->AppendPendingHandshakeData(static_cast<int>(level), data, len);
+  return 1;
+}
+
+inline int quic_flush_flight(SSL *ssl) { return 1; }
+
+inline int quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level,
+                           uint8_t alert) {
+  return 1;
+}
+
+inline const SSL_QUIC_METHOD quic_method = {
+    nullptr,                  // set_encryption_secrets
+    quic_add_handshake_data,  // add_handshake_data
+    quic_flush_flight,        // flush_flight
+    quic_send_alert,          // send_alert
+    quic_set_read_secret,     // set_read_secret
+    quic_set_write_secret     // set_write_secret
+};
+
+inline std::vector<uint8_t> SerializeAlpnProtos(
+    const std::vector<std::string> &protos) {
+  std::vector<uint8_t> wire;
+  for (const auto &p : protos) {
+    if (p.empty() || p.size() > 255) continue;
+    wire.push_back(static_cast<uint8_t>(p.size()));
+    wire.insert(wire.end(), p.begin(), p.end());
+  }
+  return wire;
+}
+
+inline int QuicAlpnSelectCallback(SSL *ssl, const unsigned char **out,
+                                  unsigned char *outlen,
+                                  const unsigned char *in, unsigned int inlen,
+                                  void *arg) {
+  for (unsigned int i = 0; i < inlen;) {
+    unsigned int len = in[i];
+    if (i + 1 + len > inlen) break;
+    i += 1 + len;
+  }
+  auto *server_alpn = static_cast<const std::vector<uint8_t> *>(arg);
+  if (!server_alpn || server_alpn->empty()) {
+    static const unsigned char default_alpn[] = {2, 'h', '3'};
+    int ret =
+        SSL_select_next_proto(const_cast<unsigned char **>(out), outlen,
+                              default_alpn, sizeof(default_alpn), in, inlen);
+    return (ret == OPENSSL_NPN_NEGOTIATED) ? SSL_TLSEXT_ERR_OK
+                                           : SSL_TLSEXT_ERR_NOACK;
+  }
+
+  int ret = SSL_select_next_proto(const_cast<unsigned char **>(out), outlen,
+                                  server_alpn->data(), server_alpn->size(), in,
+                                  inlen);
+  return (ret == OPENSSL_NPN_NEGOTIATED) ? SSL_TLSEXT_ERR_OK
+                                         : SSL_TLSEXT_ERR_NOACK;
+}
+
+inline void SetQuicTransportParams(SSL *ssl) {
+  auto *conn = static_cast<::cppquic::QuicConnection *>(SSL_get_app_data(ssl));
+  if (!conn) return;
+
+  std::vector<uint8_t> params;
+
+  auto write_param = [](std::vector<uint8_t> &buf, uint64_t id, uint64_t val) {
+    WriteVarInt(buf, id);
+    std::vector<uint8_t> val_buf;
+    WriteVarInt(val_buf, val);
+    WriteVarInt(buf, val_buf.size());
+    buf.insert(buf.end(), val_buf.begin(), val_buf.end());
+  };
+
+  // 1. original_destination_connection_id (0x00)
+  if (conn->IsServer()) {
+    const auto &orig_dcid = conn->GetOriginalDestinationConnectionId();
+    if (!orig_dcid.IsZero()) {
+      WriteVarInt(params, 0x00);
+      WriteVarInt(params, orig_dcid.length);
+      params.insert(params.end(), orig_dcid.data,
+                    orig_dcid.data + orig_dcid.length);
+    }
+  }
+
+  // 2. initial_source_connection_id (0x0f)
+  const auto &local_cid = conn->GetLocalConnectionId();
+  WriteVarInt(params, 0x0f);
+  WriteVarInt(params, local_cid.length);
+  params.insert(params.end(), local_cid.data,
+                local_cid.data + local_cid.length);
+
+  // 3. standard parameters
+  write_param(params, 0x03, 1048576);  // initial_max_data
+  write_param(params, 0x04, 1048576);  // initial_max_stream_data_bidi_local
+  write_param(params, 0x05, 1048576);  // initial_max_stream_data_bidi_remote
+  write_param(params, 0x06, 1048576);  // initial_max_stream_data_uni
+  write_param(params, 0x07, 100);      // initial_max_streams_bidi
+  write_param(params, 0x08, 100);      // initial_max_streams_uni
+  write_param(params, 0x09, 3);        // ack_delay_exponent
+  write_param(params, 0x0e, 2);        // active_connection_id_limit
+
+  SSL_set_quic_transport_params(ssl, params.data(), params.size());
+}
+
 inline void QuicKeylogCallback(const SSL *ssl, const char *line) {
   auto *conn = static_cast<::cppquic::QuicConnection *>(SSL_get_app_data(ssl));
   if (conn) {
     conn->HandleKeylogLine(line);
   }
 }
+
 }  // namespace internal
 
 // ============================================================================
@@ -3236,10 +3646,21 @@ class QuicServer {
       : listener_(port, bind_address) {
     ssl_ctx_ = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+    SSL_CTX_set_quic_method(ssl_ctx_, &internal::quic_method);
+    SSL_CTX_set_dh_auto(ssl_ctx_, 1);
+    alpn_wire_ = internal::SerializeAlpnProtos({"h3"});
+    SSL_CTX_set_alpn_select_cb(ssl_ctx_, internal::QuicAlpnSelectCallback,
+                               &alpn_wire_);
     if (!internal::GenerateSelfSignedCert(ssl_ctx_)) {
       internal::Log(LogSeverity::Error, "QuicServer",
                     "Failed to generate self-signed certificate");
     }
+  }
+
+  void SetAlpnProtos(const std::vector<std::string> &protos) {
+    alpn_wire_ = internal::SerializeAlpnProtos(protos);
+    SSL_CTX_set_alpn_select_cb(ssl_ctx_, internal::QuicAlpnSelectCallback,
+                               &alpn_wire_);
   }
 
   /**
@@ -3500,6 +3921,19 @@ class QuicServer {
               break;
             }
           }
+          // Also check if conn_id matches a known client original DCID.
+          // A nullptr entry means another thread is currently handling the
+          // first copy of this Initial — skip this duplicate.
+          if (!conn) {
+            auto it = dcid_to_conn_.find(conn_id);
+            if (it != dcid_to_conn_.end()) {
+              conn = it->second;  // may be nullptr (in-progress guard)
+              if (!conn) return;  // duplicate Initial, discard
+            } else {
+              // First time we see this DCID — reserve it to prevent races
+              dcid_to_conn_[conn_id] = nullptr;
+            }
+          }
         }
       }
     }
@@ -3513,12 +3947,15 @@ class QuicServer {
     }
 
     QuicPacket pkt;
+    bool packet_recorded = false;
     if (conn) {
       if (!conn->DeserializePacket(data, pkt)) {
         internal::Log(LogSeverity::Warn, "QuicServer",
                       "Failed to deserialize packet from " + peer.ToString());
         return;
       }
+      conn->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
+      packet_recorded = true;
     } else {
       bool is_initial = false;
       if (!data.empty() && (data[0] & 0x80)) {
@@ -3567,23 +4004,27 @@ class QuicServer {
     // Process frames
     for (const auto &frame : pkt.frames) {
       std::visit(
-          [this, &peer, &pkt, &conn, &conn_id](auto &&f) {
+          [this, &peer, &pkt, &conn, &conn_id, &packet_recorded](auto &&f) {
             using T = std::decay_t<decltype(f)>;
 
             if constexpr (std::is_same_v<T, CryptoFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
-                std::vector<uint8_t> crypto_out;
-                conn->ProcessCrypto(f.data, crypto_out);
+                auto pkts = conn->ProcessCrypto(
+                    f.offset, f.data,
+                    pkt.packet_type == 2 ? 2 : (pkt.packet_type == 0 ? 3 : 0));
+                for (const auto &p_out : pkts) {
+                  auto bytes = conn->SerializePacket(p_out);
+                  conn->AddBytesSent(bytes.size());
+                  listener_.Send(peer, bytes);
+                }
 
                 auto crypto_ctx = conn->GetCryptoContext();
                 if (crypto_ctx && crypto_ctx->handshake_complete &&
                     conn->GetState() == ConnectionState::Handshaking) {
                   conn->SetState(ConnectionState::Connected);
                   internal::Log(LogSeverity::Info, "QuicServer",
-                                "Handshake complete. Server Connected: " +
-                                    conn->GetLocalConnectionId().ToHex());
+                                "Handshake complete. Server ready.");
                   event_broker_.Publish<ConnectionEvent>(
                       "connection_events", {conn->GetLocalConnectionId(), peer,
                                             ConnectionState::Connected});
@@ -3596,14 +4037,15 @@ class QuicServer {
                 // CryptoFrame)
                 conn = HandleClientHello(peer, conn_id,
                                          pkt.source_connection_id, f);
-                if (conn) {
-                  conn->RecordReceivedPacket(pkt.packet_number);
+                if (conn && !packet_recorded) {
+                  conn->RecordReceivedPacket(pkt.packet_number,
+                                             pkt.packet_type);
+                  packet_recorded = true;
                 }
               }
             } else if constexpr (std::is_same_v<T, StreamFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 conn->AddBytesReceived(f.data.size());
                 HandleStreamFrame(conn, f);
               }
@@ -3615,8 +4057,7 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, PingFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
-                SendAck(conn);
+                SendAck(conn, pkt.packet_type);
               }
             } else if constexpr (std::is_same_v<T, ConnectionCloseFrame>) {
               if (conn) {
@@ -3636,7 +4077,6 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 PathResponseFrame resp;
                 std::memcpy(resp.data, f.data, 8);
                 auto pkt_out = conn->CreatePacket({resp});
@@ -3647,7 +4087,6 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, PathResponseFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 uint8_t pending[8];
                 conn->GetPendingChallenge(pending);
                 if (conn->IsChallengePending() &&
@@ -3660,7 +4099,6 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, StopSendingFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 auto stream = conn->GetStream(f.stream_id);
                 if (stream) {
                   stream->Reset(f.error_code);
@@ -3677,7 +4115,6 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 conn->SetMaxSendData(f.max_data);
                 conn->GenerateStreamPackets();
                 SendPendingPackets(conn);
@@ -3685,7 +4122,6 @@ class QuicServer {
             } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
               if (conn) {
                 conn->Touch();
-                conn->RecordReceivedPacket(pkt.packet_number);
                 auto stream = conn->GetStream(f.stream_id);
                 if (stream) {
                   stream->SetMaxSendOffset(f.max_stream_data);
@@ -3697,6 +4133,7 @@ class QuicServer {
           },
           frame);
     }
+    if (conn) SendAck(conn, pkt.packet_type);
   }
 
   std::shared_ptr<QuicConnection> HandleClientHello(
@@ -3716,18 +4153,19 @@ class QuicServer {
     {
       std::lock_guard<std::mutex> lock(connections_mtx_);
       connections_[local_id] = conn;
+      dcid_to_conn_[dest_id] = conn;  // Map original client DCID to this conn
     }
 
-    std::vector<uint8_t> crypto_out;
-    conn->ProcessCrypto(cf.data, crypto_out);
-    auto server_hello = conn->CreateHandshakePacket(crypto_out);
-    auto bytes = conn->SerializePacket(server_hello);
-    conn->AddBytesSent(bytes.size());
-    listener_.Send(peer, bytes);
+    // Initial packet from client: level 0 (ssl_encryption_initial)
+    auto pkts = conn->ProcessCrypto(cf.offset, cf.data, 0);
+    for (const auto &pkt : pkts) {
+      auto bytes = conn->SerializePacket(pkt);
+      conn->AddBytesSent(bytes.size());
+      listener_.Send(peer, bytes);
+    }
 
     internal::Log(LogSeverity::Info, "QuicServer",
-                  "New handshaking connection from " + peer.ToString() + " [" +
-                      local_id.ToHex() + "]");
+                  "New handshaking connection accepted");
     return conn;
   }
 
@@ -3737,7 +4175,7 @@ class QuicServer {
     bool ok = stream->OnStreamFrame(frame);
 
     // Send ACK
-    SendAck(conn);
+    SendAck(conn, 0);
 
     if (stream_data_handler_) {
       stream_data_handler_(conn, frame.stream_id, frame.data, frame.fin);
@@ -3763,11 +4201,12 @@ class QuicServer {
     }
   }
 
-  void SendAck(std::shared_ptr<QuicConnection> conn) {
-    auto ack = conn->GenerateAck();
+  void SendAck(std::shared_ptr<QuicConnection> conn, uint8_t packet_type) {
+    auto ack = conn->GenerateAck(packet_type);
+    if (ack.acknowledged_packets.empty()) return;
     std::vector<QuicFrame> frames;
     frames.push_back(std::move(ack));
-    auto pkt = conn->CreatePacket(std::move(frames));
+    auto pkt = conn->CreatePacket(std::move(frames), packet_type);
     auto bytes = conn->SerializePacket(pkt);
     conn->AddBytesSent(bytes.size());
     listener_.Send(conn->GetPeer(), bytes);
@@ -3804,8 +4243,7 @@ class QuicServer {
           conn->SetState(ConnectionState::Closed);
 
           internal::Log(LogSeverity::Info, "QuicServer",
-                        "Connection idle timeout: " +
-                            conn->GetLocalConnectionId().ToHex());
+                        "Connection closed due to idle timeout");
 
           event_broker_.Publish<ConnectionEvent>(
               "connection_events", {conn->GetLocalConnectionId(),
@@ -3827,6 +4265,7 @@ class QuicServer {
   }
 
   SSL_CTX *ssl_ctx_ = nullptr;
+  std::vector<uint8_t> alpn_wire_;
   cppudpnet::UdpListener listener_;
   cpppubsub::PubSub event_broker_;
 
@@ -3837,6 +4276,11 @@ class QuicServer {
   std::unordered_map<ConnectionId, std::shared_ptr<QuicConnection>,
                      ConnectionIdHash>
       connections_;
+  // Maps client's original Destination CID -> established connection
+  // Needed to route retransmitted Initial packets to the same connection
+  std::unordered_map<ConnectionId, std::shared_ptr<QuicConnection>,
+                     ConnectionIdHash>
+      dcid_to_conn_;
 
   std::function<void(std::shared_ptr<QuicConnection>)> connection_handler_;
   std::function<void(std::shared_ptr<QuicConnection>, uint64_t,
@@ -3864,9 +4308,14 @@ class QuicClient {
   QuicClient() {
     ssl_ctx_ = SSL_CTX_new(TLS_client_method());
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+    SSL_CTX_set_quic_method(ssl_ctx_, &internal::quic_method);
     // Accept self-signed server certificates by default. Developers can supply
     // their own verified CA store via SSL_CTX_load_verify_locations if needed.
     SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_NONE, nullptr);
+  }
+
+  void SetAlpnProtos(const std::vector<std::string> &protos) {
+    alpn_protos_ = protos;
   }
 
   /**
@@ -3938,6 +4387,11 @@ class QuicClient {
       }
     });
 
+    sender_.SetErrorHandler([this](int code, const std::string &msg) {
+      internal::Log(LogSeverity::Error, "QuicClient",
+                    msg + " (code: " + std::to_string(code) + ")");
+    });
+
     sender_.Start();
     running_.store(true);
 
@@ -4003,17 +4457,18 @@ class QuicClient {
                                                         // Initial keys!
 
     connection_ = std::make_shared<QuicConnection>(
-        local_id, remote_id, server_address_, false, ssl_ctx_);
+        local_id, remote_id, server_address_, false, ssl_ctx_, ConnectionId{},
+        alpn_protos_);
     connection_->SetCongestionControlAlgorithm(cc_algorithm_);
     connection_->SetAutoFlowControl(auto_flow_control_);
     connection_->SetState(ConnectionState::Handshaking);
 
-    std::vector<uint8_t> crypto_out;
-    connection_->ProcessCrypto({}, crypto_out);
-    auto pkt = connection_->CreateHandshakePacket(crypto_out);
-    auto bytes = connection_->SerializePacket(pkt);
-    connection_->AddBytesSent(bytes.size());
-    sender_.Send(host, port, bytes);
+    auto pkts = connection_->ProcessCrypto(0, {}, 0);
+    for (const auto &pkt : pkts) {
+      auto bytes = connection_->SerializePacket(pkt);
+      connection_->AddBytesSent(bytes.size());
+      sender_.Send(host, port, bytes);
+    }
 
     internal::Log(
         LogSeverity::Info, "QuicClient",
@@ -4209,6 +4664,7 @@ class QuicClient {
                       "Failed to deserialize packet from server");
         return;
       }
+      connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
     } else {
       // Derive Initial keys to decrypt Server Initial packet
       std::vector<uint8_t> temp_read_key;
@@ -4227,6 +4683,9 @@ class QuicClient {
                       "Failed to deserialize Initial packet from server");
         return;
       }
+      if (connection_) {
+        connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
+      }
     }
 
     for (const auto &frame : pkt.frames) {
@@ -4236,14 +4695,13 @@ class QuicClient {
 
             if constexpr (std::is_same_v<T, CryptoFrame>) {
               if (connection_) {
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 // Server source connection ID is updated in the connection!
                 connection_->SetRemoteConnectionId(pkt.source_connection_id);
 
-                std::vector<uint8_t> crypto_out;
-                connection_->ProcessCrypto(f.data, crypto_out);
-                if (!crypto_out.empty()) {
-                  auto pkt_out = connection_->CreateHandshakePacket(crypto_out);
+                auto pkts = connection_->ProcessCrypto(
+                    f.offset, f.data,
+                    pkt.packet_type == 2 ? 2 : (pkt.packet_type == 0 ? 3 : 0));
+                for (const auto &pkt_out : pkts) {
                   auto bytes = connection_->SerializePacket(pkt_out);
                   connection_->AddBytesSent(bytes.size());
                   sender_.Send(server_address_, bytes);
@@ -4260,14 +4718,13 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, StreamFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 connection_->AddBytesReceived(f.data.size());
 
                 auto stream = connection_->GetOrCreateStream(f.stream_id);
                 bool ok = stream->OnStreamFrame(f);
 
                 // Send ACK
-                SendAck();
+                SendAck(0);
 
                 if (stream_data_handler_) {
                   stream_data_handler_(f.stream_id, f.data, f.fin);
@@ -4300,14 +4757,13 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, PingFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
-                SendAck();
+                SendAck(pkt.packet_type);
               }
             } else if constexpr (std::is_same_v<T, ConnectionCloseFrame>) {
               if (connection_) {
                 connection_->SetState(ConnectionState::Closed);
                 internal::Log(LogSeverity::Info, "QuicClient",
-                              "Connection closed by server: " + f.reason);
+                              "Connection closed by server");
               }
             } else if constexpr (std::is_same_v<T, ResetStreamFrame>) {
               if (connection_) {
@@ -4319,7 +4775,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 PathResponseFrame resp;
                 std::memcpy(resp.data, f.data, 8);
                 auto pkt_out = connection_->CreatePacket({resp});
@@ -4330,7 +4785,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, PathResponseFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 uint8_t pending[8];
                 connection_->GetPendingChallenge(pending);
                 if (connection_->IsChallengePending() &&
@@ -4343,7 +4797,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, StopSendingFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 auto stream = connection_->GetStream(f.stream_id);
                 if (stream) {
                   stream->Reset(f.error_code);
@@ -4360,7 +4813,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 connection_->SetMaxSendData(f.max_data);
                 connection_->GenerateStreamPackets();
                 SendPendingPackets();
@@ -4368,7 +4820,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 auto stream = connection_->GetStream(f.stream_id);
                 if (stream) {
                   stream->SetMaxSendOffset(f.max_stream_data);
@@ -4379,7 +4830,6 @@ class QuicClient {
             } else if constexpr (std::is_same_v<T, HandshakeDoneFrame>) {
               if (connection_) {
                 connection_->Touch();
-                connection_->RecordReceivedPacket(pkt.packet_number);
                 if (connection_->GetState() == ConnectionState::Handshaking) {
                   connection_->SetState(ConnectionState::Connected);
                   internal::Log(
@@ -4393,12 +4843,13 @@ class QuicClient {
     }
   }
 
-  void SendAck() {
+  void SendAck(uint8_t packet_type) {
     if (!connection_) return;
-    auto ack = connection_->GenerateAck();
+    auto ack = connection_->GenerateAck(packet_type);
+    if (ack.acknowledged_packets.empty()) return;
     std::vector<QuicFrame> frames;
     frames.push_back(std::move(ack));
-    auto pkt = connection_->CreatePacket(std::move(frames));
+    auto pkt = connection_->CreatePacket(std::move(frames), packet_type);
     auto bytes = connection_->SerializePacket(pkt);
     connection_->AddBytesSent(bytes.size());
     sender_.Send(server_address_, bytes);
@@ -4425,6 +4876,7 @@ class QuicClient {
   }
 
   SSL_CTX *ssl_ctx_ = nullptr;
+  std::vector<std::string> alpn_protos_ = {"h3"};
   cppudpnet::UdpSender sender_;
 
   std::atomic<bool> running_{false};

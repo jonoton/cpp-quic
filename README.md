@@ -5,10 +5,11 @@
 ## Features
 - **Header-Only:** Include `cppquic.hpp` in your project.
 - **Cross-Platform:** Native support for Windows (`Winsock2`) and POSIX (`poll`).
-- **TLS 1.3 Encryption:** Mandatory TLS handshake and AES-GCM-128 packet encryption using LibreSSL (default) or OpenSSL.
-- **QUIC Protocol:** Connection IDs, multiplexed streams, packet numbering, ACKs, and retransmission.
+- **TLS 1.3 Encryption:** Mandatory TLS handshake, ALPN negotiation, transport parameters configuration, and AES-GCM (128/256-bit) packet encryption with AAD and header protection using LibreSSL (default) or OpenSSL.
+- **QUIC Protocol:** Connection IDs, multiplexed streams, packet numbering, RFC 9000 compliant ACK ranges (sparse ACKs), and retransmission.
 - **Multiplexed Streams:** Multiple bidirectional or unidirectional streams over a single connection.
 - **Reliable Delivery:** Packet-level ACK tracking with time-based retransmission.
+- **ALPN Negotiation:** Set custom application protocol identifiers (e.g., `"h3"`) on clients and servers.
 - **Ordered Byte Streams:** Out-of-order packet reassembly for in-order stream delivery.
 - **Stream Flow Control:** Per-stream receive window limits prevent buffer overflow.
 - **Congestion Control:** Support for multiple congestion control algorithms (`NewReno` (default), `Cubic`, `ConstantWindow`) to adjust the congestion window and pace transmissions.
