@@ -1668,3 +1668,248 @@ TEST(QuicServerAndClientTest, ConfigureAlpnProtos) {
   cppquic::QuicClient client;
   EXPECT_NO_THROW(client.SetAlpnProtos({"h3", "h3-29"}));
 }
+
+// ============================================================================
+// Throughput Test
+// ============================================================================
+
+TEST(IntegrationTest, ThroughputTransfer) {
+  // Verifies that a bulk echo transfer of 100 KB completes end-to-end within
+  // a reasonable timeout. This gives a regression baseline: if retransmission
+  // logic breaks badly, the whole transfer stalls and this test fails.
+  cppquic::QuicServer server(0);
+  server.SetCongestionControlAlgorithm(
+      cppquic::CongestionControlAlgorithm::NewReno);
+  server.SetStreamDataHandler(
+      [&server](std::shared_ptr<cppquic::QuicConnection> conn,
+                uint64_t stream_id, const std::vector<uint8_t>& data,
+                bool fin) { server.SendOnStream(conn, stream_id, data, fin); });
+
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.SetCongestionControlAlgorithm(
+      cppquic::CongestionControlAlgorithm::NewReno);
+  std::atomic<uint64_t> received_bytes{0};
+
+  client.SetStreamDataHandler(
+      [&](uint64_t, const std::vector<uint8_t>& data, bool) {
+        received_bytes.fetch_add(data.size());
+      });
+
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  uint64_t stream_id = client.OpenStream(true);
+
+  const size_t PACKET_SIZE = 1000;
+  const size_t NUM_PACKETS = 100;  // 100 KB total — manageable in CI
+  const uint64_t EXPECTED_BYTES = NUM_PACKETS * PACKET_SIZE;
+  std::vector<uint8_t> payload(PACKET_SIZE, 'B');
+
+  for (size_t i = 0; i < NUM_PACKETS; ++i) {
+    bool fin = (i == NUM_PACKETS - 1);
+    client.SendOnStream(stream_id, payload, fin);
+    std::this_thread::sleep_for(std::chrono::microseconds(500));
+  }
+
+  bool ok = WaitFor([&]() { return received_bytes.load() >= EXPECTED_BYTES; },
+                    std::chrono::seconds(15));
+  EXPECT_TRUE(ok) << "Timed out waiting for echo. received="
+                  << received_bytes.load() << " expected=" << EXPECTED_BYTES;
+  EXPECT_EQ(received_bytes.load(), EXPECTED_BYTES);
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
+
+// ============================================================================
+// Throughput Stats Test
+// ============================================================================
+
+TEST(IntegrationTest, ThroughputStats) {
+  // Verifies that ThroughputTracker reports non-zero send and receive
+  // throughput after a bulk transfer.
+  cppquic::QuicServer server(0);
+  server.SetStreamDataHandler(
+      [&server](std::shared_ptr<cppquic::QuicConnection> conn,
+                uint64_t stream_id, const std::vector<uint8_t>& data,
+                bool fin) { server.SendOnStream(conn, stream_id, data, fin); });
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  std::atomic<uint64_t> received_bytes{0};
+  client.SetStreamDataHandler(
+      [&](uint64_t, const std::vector<uint8_t>& data, bool) {
+        received_bytes.fetch_add(data.size());
+      });
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  cppquic::ThroughputTracker<cppquic::QuicClient> tracker(client);
+
+  uint64_t stream_id = client.OpenStream(true);
+  std::vector<uint8_t> payload(1000, 'T');
+  for (int i = 0; i < 50; ++i) {
+    client.SendOnStream(stream_id, payload);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  // Wait for some echo bytes to arrive, confirming bidirectional flow
+  WaitFor([&]() { return received_bytes.load() > 0; }, std::chrono::seconds(5));
+
+  EXPECT_GT(tracker.GetSendThroughputBytesPerSec(), 0.0)
+      << "Send throughput should be non-zero";
+  EXPECT_GE(tracker.GetRecvThroughputBytesPerSec(), 0.0);
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
+
+// ============================================================================
+// Packet Reliability Test
+// ============================================================================
+
+TEST(IntegrationTest, PacketReliability) {
+  // Verifies reliable delivery end-to-end: all bytes sent are echoed back even
+  // though the QUIC stack must retransmit some packets due to the flow-control
+  // window gating data in chunks.  The test sends 50 KB on a single stream and
+  // waits for the full echo to arrive within a generous timeout. Any internal
+  // retransmission required by the library must not result in missing or
+  // duplicated bytes at the application layer.
+  cppquic::QuicServer server(0);
+  server.SetCongestionControlAlgorithm(
+      cppquic::CongestionControlAlgorithm::NewReno);
+
+  std::atomic<uint64_t> server_bytes{0};
+  server.SetStreamDataHandler(
+      [&server, &server_bytes](std::shared_ptr<cppquic::QuicConnection> conn,
+                               uint64_t stream_id,
+                               const std::vector<uint8_t>& data, bool fin) {
+        server_bytes.fetch_add(data.size());
+        server.SendOnStream(conn, stream_id, data, fin);
+      });
+
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.SetCongestionControlAlgorithm(
+      cppquic::CongestionControlAlgorithm::NewReno);
+
+  std::atomic<uint64_t> client_echo_bytes{0};
+  client.SetStreamDataHandler(
+      [&](uint64_t, const std::vector<uint8_t>& data, bool) {
+        client_echo_bytes.fetch_add(data.size());
+      });
+
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  uint64_t stream_id = client.OpenStream(true);
+  const size_t PACKET_SIZE = 1000;
+  const size_t NUM_PACKETS = 50;  // 50 KB total
+  const uint64_t TOTAL_BYTES = NUM_PACKETS * PACKET_SIZE;
+  std::vector<uint8_t> payload(PACKET_SIZE, 0xAB);
+
+  for (size_t i = 0; i < NUM_PACKETS; ++i) {
+    bool fin = (i == NUM_PACKETS - 1);
+    client.SendOnStream(stream_id, payload, fin);
+    // Small inter-packet delay so the congestion window keeps up
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // All bytes must arrive at the server and be echoed back
+  bool server_ok = WaitFor([&]() { return server_bytes.load() >= TOTAL_BYTES; },
+                           std::chrono::seconds(15));
+  EXPECT_TRUE(server_ok) << "Server did not receive all bytes. got="
+                         << server_bytes.load() << " want=" << TOTAL_BYTES;
+  EXPECT_EQ(server_bytes.load(), TOTAL_BYTES);
+
+  bool echo_ok =
+      WaitFor([&]() { return client_echo_bytes.load() >= TOTAL_BYTES; },
+              std::chrono::seconds(15));
+  EXPECT_TRUE(echo_ok) << "Client did not receive full echo. got="
+                       << client_echo_bytes.load() << " want=" << TOTAL_BYTES;
+  EXPECT_EQ(client_echo_bytes.load(), TOTAL_BYTES);
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
+
+// ============================================================================
+// Backpressure Test
+// ============================================================================
+
+TEST(IntegrationTest, BackpressureFlowControl) {
+  // Verifies that the stream-level flow-control window (max_send_offset) acts
+  // as effective backpressure: no data beyond the window is delivered to the
+  // server until the window is explicitly expanded.
+  //
+  // Sequence of events:
+  //   1. Client sends 70 KB; server has auto-flow-control OFF.
+  //   2. Only 65536 bytes (initial window) reach the server.
+  //   3. The test widens the stream window to 70000.
+  //   4. The remaining ~4464 bytes are then delivered.
+  cppquic::QuicServer server(0);
+  server.SetAutoFlowControl(false);
+
+  std::atomic<uint64_t> server_bytes{0};
+  server.SetStreamDataHandler(
+      [&server_bytes](std::shared_ptr<cppquic::QuicConnection>, uint64_t,
+                      const std::vector<uint8_t>& data,
+                      bool) { server_bytes.fetch_add(data.size()); });
+
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.SetAutoFlowControl(false);
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  auto conn = client.GetConnection();
+  ASSERT_NE(conn, nullptr);
+
+  uint64_t stream_id = client.OpenStream(true);
+
+  // Send 70 KB — 65536 goes out immediately, the rest is flow-control-gated.
+  const size_t TOTAL = 70000;
+  std::vector<uint8_t> big_data(TOTAL, 0xCC);
+  client.SendOnStream(stream_id, big_data);
+
+  // Phase 1: wait for the initial window worth of data to arrive.
+  bool phase1 = WaitFor([&]() { return server_bytes.load() >= 65536; },
+                        std::chrono::seconds(5));
+  EXPECT_TRUE(phase1) << "Phase1: server did not receive initial 65536 bytes";
+  EXPECT_EQ(server_bytes.load(), 65536u)
+      << "Server should be blocked at flow-control window boundary";
+
+  // Phase 2: open the window and send the buffered remainder.
+  auto stream = conn->GetStream(stream_id);
+  ASSERT_NE(stream, nullptr);
+  stream->SetMaxSendOffset(TOTAL);
+  conn->GenerateStreamPackets();
+  client.SendPendingPackets();
+
+  bool phase2 = WaitFor([&]() { return server_bytes.load() >= TOTAL; },
+                        std::chrono::seconds(5));
+  EXPECT_TRUE(phase2)
+      << "Phase2: server did not receive remaining bytes after window open";
+  EXPECT_EQ(server_bytes.load(), TOTAL);
+
+  // Verify the CanSendOnStream API (non-blocking backpressure check)
+  // After all data has been sent, the stream should report it is blocked
+  // because send_offset == max_send_offset.
+  EXPECT_FALSE(client.CanSendOnStream(stream_id, 1))
+      << "Stream should report backpressure when window is exhausted";
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}

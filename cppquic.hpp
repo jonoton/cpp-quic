@@ -8,16 +8,14 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <random>
-#include <shared_mutex>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -26,14 +24,11 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <openssl/hmac.h>
 #include <openssl/x509.h>
-#include <openssl/x509v3.h>
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 5;
+constexpr int VERSION_MINOR = 6;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -1948,6 +1943,11 @@ class QuicStream {
       return false;
     }
 
+    if (frame.offset + frame.data.size() <= recv_offset_) {
+      // Already received and processed
+      return true;
+    }
+
     if (frame.offset + frame.data.size() > max_recv_offset_) {
       // Flow control violation
       return false;
@@ -2030,6 +2030,11 @@ class QuicStream {
   uint64_t GetMaxRecvOffset() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return max_recv_offset_;
+  }
+
+  bool IsSendBufferEmpty() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return send_buffer_.empty();
   }
 
  private:
@@ -2188,6 +2193,11 @@ class NewRenoCongestionController : public CongestionController {
     } else {
       // Congestion Avoidance
       cwnd_ += (max_datagram_size_ * acked_bytes) / cwnd_;
+    }
+
+    const size_t MAX_CWND = 30 * max_datagram_size_;
+    if (cwnd_ > MAX_CWND) {
+      cwnd_ = MAX_CWND;
     }
   }
 
@@ -3056,11 +3066,28 @@ class QuicConnection {
     size_t acked = 0;
     auto now = std::chrono::steady_clock::now();
     for (auto pkt_num : ack.acknowledged_packets) {
-      auto it = sent_packets_.find(pkt_num);
+      uint64_t target_pn = pkt_num;
+      auto map_it = retransmitted_packets_.find(target_pn);
+      while (map_it != retransmitted_packets_.end()) {
+        target_pn = map_it->second;
+        map_it = retransmitted_packets_.find(target_pn);
+      }
+
+      auto it = sent_packets_.find(target_pn);
       if (it != sent_packets_.end()) {
+        // Update RTT estimate (RFC 9002 §5)
+        double sample_ms = std::chrono::duration<double, std::milli>(
+                               now - it->second.send_time)
+                               .count();
+        if (sample_ms > 0.0) {
+          double rtt_diff = std::abs(sample_ms - smoothed_rtt_ms_);
+          smoothed_rtt_ms_ = 0.875 * smoothed_rtt_ms_ + 0.125 * sample_ms;
+          rtt_var_ms_ = 0.75 * rtt_var_ms_ + 0.25 * rtt_diff;
+        }
+
         if (congestion_controller_) {
-          congestion_controller_->OnPacketAcked(pkt_num, it->second.packet_size,
-                                                it->second.send_time, now);
+          congestion_controller_->OnPacketAcked(
+              target_pn, it->second.packet_size, it->second.send_time, now);
         }
         sent_packets_.erase(it);
         acked++;
@@ -3108,15 +3135,25 @@ class QuicConnection {
    * @param timeout Time since send after which a packet is considered lost.
    */
   std::vector<QuicPacket> GetRetransmissions(
-      std::chrono::milliseconds timeout = std::chrono::milliseconds(500)) {
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
     std::lock_guard<std::mutex> lock(mtx_);
+    // RFC 9002 §6.2.1: RTO = SRTT + max(4*RTTVAR, 1ms), floor at 200ms
+    // The 200ms floor prevents sub-millisecond RTO on loopback which causes
+    // exponential retransmission storms.
+    double computed_rto_ms =
+        smoothed_rtt_ms_ + std::max(4.0 * rtt_var_ms_, 1.0);
+    computed_rto_ms = std::max(computed_rto_ms, 200.0);
+    auto effective_timeout =
+        (timeout.count() > 0)
+            ? timeout
+            : std::chrono::milliseconds(static_cast<int64_t>(computed_rto_ms));
     auto now = std::chrono::steady_clock::now();
     std::vector<QuicPacket> retransmits;
 
     std::vector<uint64_t> lost_packets;
     std::vector<LostPacketInfo> lost_infos;
     for (auto &[pkt_num, info] : sent_packets_) {
-      if (now - info.send_time > timeout) {
+      if (now - info.send_time > effective_timeout) {
         lost_packets.push_back(pkt_num);
         lost_infos.push_back({pkt_num, info.packet_size, info.send_time});
       }
@@ -3129,9 +3166,9 @@ class QuicConnection {
     for (auto pkt_num : lost_packets) {
       auto it = sent_packets_.find(pkt_num);
       if (it != sent_packets_.end()) {
-        // Create a new packet with the same frames
         QuicPacket pkt;
         pkt.connection_id = remote_connection_id_;
+        pkt.source_connection_id = local_connection_id_;
         pkt.packet_number = next_packet_number_++;
         pkt.frames = it->second.frames;
         pkt.packet_type = it->second.packet_type;
@@ -3143,6 +3180,14 @@ class QuicConnection {
         new_info.frames = pkt.frames;
         new_info.packet_size = it->second.packet_size;
         new_info.packet_type = pkt.packet_type;
+
+        // Update any existing mappings to point to the new packet number
+        for (auto &[old_pn, new_pn] : retransmitted_packets_) {
+          if (new_pn == pkt_num) {
+            new_pn = pkt.packet_number;
+          }
+        }
+        retransmitted_packets_[pkt_num] = pkt.packet_number;
 
         // Remove old, add new
         sent_packets_.erase(it);
@@ -3363,11 +3408,32 @@ class QuicConnection {
           conn_allowed = max_send_data_ - total_stream_bytes_sent_;
         }
         if (conn_allowed == 0) {
+          static int conn_blocked_count = 0;
+          if (conn_blocked_count++ % 5000 == 0) {
+            internal::Log(LogSeverity::Info, "FlowControl",
+                          std::string(is_server_ ? "Server" : "Client") +
+                              ": Blocked on connection limit: max_send_data_=" +
+                              std::to_string(max_send_data_) +
+                              ", total_stream_bytes_sent_=" +
+                              std::to_string(total_stream_bytes_sent_));
+          }
           break;
         }
 
         auto frames = stream->PullWriteFrames(conn_allowed);
         if (frames.empty()) {
+          static int stream_blocked_count = 0;
+          if (stream_blocked_count++ % 5000 == 0 &&
+              stream->GetState() == StreamState::Open &&
+              !stream->IsSendBufferEmpty()) {
+            internal::Log(
+                LogSeverity::Info, "FlowControl",
+                std::string(is_server_ ? "Server" : "Client") +
+                    ": Blocked on stream/conn limit: max_send_offset_=" +
+                    std::to_string(stream->GetMaxSendOffset()) +
+                    ", send_offset_=" +
+                    std::to_string(stream->GetSendOffset()));
+          }
           break;
         }
 
@@ -3420,6 +3486,11 @@ class QuicConnection {
 
   // Sent packet tracking for retransmission
   std::map<uint64_t, SentPacketInfo> sent_packets_;
+  std::unordered_map<uint64_t, uint64_t> retransmitted_packets_;
+
+  // RTT estimation (RFC 9002 §5)
+  double smoothed_rtt_ms_ = 100.0;  // initial conservative estimate
+  double rtt_var_ms_ = 50.0;
 
   // Received packet tracking for ACK generation per packet number space
   std::vector<uint64_t> received_packets_[4];
@@ -4051,6 +4122,7 @@ class QuicServer {
               }
             } else if constexpr (std::is_same_v<T, AckFrame>) {
               if (conn) {
+                conn->Touch();
                 conn->ProcessAck(f);
                 SendPendingPackets(conn);
               }
@@ -4177,13 +4249,21 @@ class QuicServer {
     // Send ACK
     SendAck(conn, 0);
 
-    if (stream_data_handler_) {
-      stream_data_handler_(conn, frame.stream_id, frame.data, frame.fin);
+    std::vector<uint8_t> data;
+    bool is_finished = false;
+    if (ok && (stream_data_handler_ || conn->IsAutoFlowControlEnabled())) {
+      data = stream->Read(0);
+      is_finished = stream->IsFinished();
+    }
+
+    if (stream_data_handler_ && (!data.empty() || is_finished)) {
+      stream_data_handler_(conn, frame.stream_id, data, is_finished);
     }
 
     if (ok && conn->IsAutoFlowControlEnabled()) {
-      stream->Read(0);
-      conn->AddBytesRead(frame.data.size());
+      if (!data.empty()) {
+        conn->AddBytesRead(data.size());
+      }
       MaxStreamDataFrame max_stream;
       max_stream.stream_id = frame.stream_id;
       max_stream.max_stream_data = stream->GetMaxRecvOffset();
@@ -4219,7 +4299,7 @@ class QuicServer {
 
   void MaintenanceLoop() {
     while (running_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
       std::vector<std::shared_ptr<QuicConnection>> conns;
       {
@@ -4253,12 +4333,13 @@ class QuicServer {
           continue;
         }
 
-        // Process retransmissions
-        auto retransmits = conn->GetRetransmissions();
+        // Process retransmissions with pacing
+        auto retransmits = conn->GetRetransmissions();  // uses RTT-based RTO
         for (auto &pkt : retransmits) {
           auto bytes = conn->SerializePacket(pkt);
           conn->AddBytesSent(bytes.size());
           listener_.Send(conn->GetPeer(), bytes);
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
       }
     }
@@ -4589,6 +4670,33 @@ class QuicClient {
   }
 
   /**
+   * @brief Non-blocking backpressure check. Returns true if the stream has
+   * enough flow-control budget to send @p bytes without blocking.
+   *
+   * Use this to implement application-level backpressure: if CanSendOnStream
+   * returns false, the stream's flow-control window is exhausted and you
+   * should wait for a MaxStreamData update before queuing more data.
+   */
+  bool CanSendOnStream(uint64_t stream_id, size_t bytes) const {
+    if (!connection_) return false;
+    auto stream = connection_->GetStream(stream_id);
+    if (!stream) return false;
+
+    // Check stream-level flow control
+    if (stream->GetSendOffset() + bytes > stream->GetMaxSendOffset()) {
+      return false;
+    }
+
+    // Check connection-level flow control
+    if (connection_->GetTotalStreamBytesSent() + bytes >
+        connection_->GetMaxSendData()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
    * @brief Returns the current connection, or nullptr.
    */
   std::shared_ptr<QuicConnection> GetConnection() const { return connection_; }
@@ -4695,8 +4803,12 @@ class QuicClient {
 
             if constexpr (std::is_same_v<T, CryptoFrame>) {
               if (connection_) {
-                // Server source connection ID is updated in the connection!
-                connection_->SetRemoteConnectionId(pkt.source_connection_id);
+                // Server source connection ID is updated in the connection only
+                // during handshake
+                if (connection_->GetState() == ConnectionState::Handshaking &&
+                    !pkt.source_connection_id.IsZero()) {
+                  connection_->SetRemoteConnectionId(pkt.source_connection_id);
+                }
 
                 auto pkts = connection_->ProcessCrypto(
                     f.offset, f.data,
@@ -4726,13 +4838,22 @@ class QuicClient {
                 // Send ACK
                 SendAck(0);
 
-                if (stream_data_handler_) {
-                  stream_data_handler_(f.stream_id, f.data, f.fin);
+                std::vector<uint8_t> data;
+                bool is_finished = false;
+                if (ok && (stream_data_handler_ ||
+                           connection_->IsAutoFlowControlEnabled())) {
+                  data = stream->Read(0);
+                  is_finished = stream->IsFinished();
+                }
+
+                if (stream_data_handler_ && (!data.empty() || is_finished)) {
+                  stream_data_handler_(f.stream_id, data, is_finished);
                 }
 
                 if (ok && connection_->IsAutoFlowControlEnabled()) {
-                  stream->Read(0);
-                  connection_->AddBytesRead(f.data.size());
+                  if (!data.empty()) {
+                    connection_->AddBytesRead(data.size());
+                  }
                   MaxStreamDataFrame max_stream;
                   max_stream.stream_id = f.stream_id;
                   max_stream.max_stream_data = stream->GetMaxRecvOffset();
@@ -4751,6 +4872,7 @@ class QuicClient {
               }
             } else if constexpr (std::is_same_v<T, AckFrame>) {
               if (connection_) {
+                connection_->Touch();
                 connection_->ProcessAck(f);
                 SendPendingPackets();
               }
@@ -4857,7 +4979,7 @@ class QuicClient {
 
   void MaintenanceLoop() {
     while (running_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
       if (!connection_ ||
           (connection_->GetState() != ConnectionState::Connected &&
@@ -4865,12 +4987,14 @@ class QuicClient {
         continue;
       }
 
-      // Process retransmissions
-      auto retransmits = connection_->GetRetransmissions();
+      // Process retransmissions with pacing
+      auto retransmits =
+          connection_->GetRetransmissions();  // uses RTT-based RTO
       for (auto &pkt : retransmits) {
         auto bytes = connection_->SerializePacket(pkt);
         connection_->AddBytesSent(bytes.size());
         sender_.Send(server_address_, bytes);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
     }
   }

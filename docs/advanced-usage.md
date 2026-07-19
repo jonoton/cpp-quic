@@ -119,6 +119,21 @@ if (conn) {
 }
 ```
 
+### Backpressure Detection (Client Side)
+
+To prevent application code from queuing more stream data than the current stream-level or connection-level flow-control windows allow, `QuicClient` provides a public, non-blocking method `CanSendOnStream(stream_id, bytes)`:
+
+```cpp
+// Check if the stream and connection windows can accommodate 1200 bytes
+if (client.CanSendOnStream(stream_id, 1200)) {
+    client.SendOnStream(stream_id, data);
+} else {
+    // Backpressure: window is full. Yield or delay sending.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
+```
+
+
 ## Stream Lifecycle
 
 Streams transition through the following states:
