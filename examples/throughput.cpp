@@ -1,6 +1,8 @@
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,22 +15,41 @@ std::atomic<uint64_t> server_bytes_received(0);
 std::atomic<uint64_t> client_bytes_received(0);
 bool use_backpressure = false;
 
+std::mutex server_mutex;
+std::condition_variable server_startup_cv;
+bool server_listening = false;
+std::condition_variable server_connection_cv;
+bool client_connected = false;
+std::condition_variable server_data_cv;
+uint16_t server_port = 0;  // populated after Start()
+
+std::mutex client_mutex;
+std::condition_variable client_data_cv;
+std::condition_variable flow_control_cv;
+
 const size_t PACKET_SIZE = 1200;
 const size_t TOTAL_PACKETS = 10000;
 const uint64_t TOTAL_BYTES = TOTAL_PACKETS * PACKET_SIZE;
 
 void RunServer() {
-  QuicServer server(4435);
+  QuicServer server(0);
   server.SetRecvBufferSize(16 * 1024 * 1024);
   server.SetSendBufferSize(16 * 1024 * 1024);
   server.SetIdleTimeout(std::chrono::milliseconds(120000));
   server.SetCongestionControlAlgorithm(CongestionControlAlgorithm::NewReno);
+
+  server.SetConnectionHandler([](std::shared_ptr<QuicConnection>) {
+    std::lock_guard<std::mutex> lock(server_mutex);
+    client_connected = true;
+    server_connection_cv.notify_one();
+  });
 
   server.SetStreamDataHandler(
       [&server](std::shared_ptr<QuicConnection> conn, uint64_t stream_id,
                 const std::vector<uint8_t> &data, bool fin) {
         server_bytes_received += data.size();
         server.SendOnStream(conn, stream_id, data, fin);
+        server_data_cv.notify_one();
       });
 
   server.SetErrorHandler([](int code, const std::string &msg) {
@@ -38,46 +59,57 @@ void RunServer() {
 
   try {
     server.Start();
-    std::cout << "[Server] Listening on port 4435..." << std::endl;
+    {
+      std::lock_guard<std::mutex> lock(server_mutex);
+      server_port = server.GetLocalPort();
+      server_listening = true;
+    }
+    server_startup_cv.notify_one();
+    std::cout << "[Server] Listening on port " << server_port << "..."
+              << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "[Server] Start failed: " << e.what() << std::endl;
     return;
   }
 
   // Wait for client to connect
-  auto server_start = std::chrono::steady_clock::now();
-  while (server.GetActiveConnectionCount() == 0) {
-    if (std::chrono::steady_clock::now() - server_start >
-        std::chrono::seconds(10)) {
+  {
+    std::unique_lock<std::mutex> lock(server_mutex);
+    if (!server_connection_cv.wait_for(lock, std::chrono::seconds(10),
+                                       [] { return client_connected; })) {
       std::cerr << "[Server] Timeout waiting for client to connect."
                 << std::endl;
-      break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
-  // Wait until all intended bytes are received, or until the client
-  // disconnects, resetting the activity timer whenever new data arrives.
-  auto last_activity = std::chrono::steady_clock::now();
-  uint64_t last_srv_bytes = 0;
-  while (server.GetActiveConnectionCount() > 0) {
-    auto now = std::chrono::steady_clock::now();
-    uint64_t cur = server_bytes_received.load();
-    if (cur > last_srv_bytes) {
-      last_srv_bytes = cur;
-      last_activity = now;
+  // Wait until all intended bytes are received. Activity timeout is handled via
+  // wait_for.
+  {
+    std::unique_lock<std::mutex> lock(server_mutex);
+    while (server_bytes_received.load() < TOTAL_BYTES) {
+      if (server_data_cv.wait_for(lock, std::chrono::seconds(30)) ==
+          std::cv_status::timeout) {
+        std::cout << "[Server] Stalled — no new data for 30 s. Stopping."
+                  << std::endl;
+        break;
+      }
     }
-    if (cur >= TOTAL_BYTES) {
-      std::cout << "[Server] All " << TOTAL_BYTES << " bytes received."
-                << std::endl;
-      break;
+  }
+
+  if (server_bytes_received.load() >= TOTAL_BYTES) {
+    std::cout << "[Server] All " << TOTAL_BYTES
+              << " bytes received. Waiting for client to disconnect..."
+              << std::endl;
+    auto wait_disconnect_start = std::chrono::steady_clock::now();
+    while (server.GetActiveConnectionCount() > 0) {
+      if (std::chrono::steady_clock::now() - wait_disconnect_start >
+          std::chrono::seconds(10)) {
+        std::cout << "[Server] Timeout waiting for client to disconnect."
+                  << std::endl;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (now - last_activity > std::chrono::seconds(30)) {
-      std::cout << "[Server] Stalled — no new data for 30 s. Stopping."
-                << std::endl;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 
   server.Stop();
@@ -93,7 +125,13 @@ void RunClient() {
   client.SetStreamDataHandler(
       [](uint64_t, const std::vector<uint8_t> &data, bool) {
         client_bytes_received += data.size();
+        client_data_cv.notify_one();
       });
+
+  client.SetFlowControlHandler([&]() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    flow_control_cv.notify_all();
+  });
 
   client.SetErrorHandler([](int code, const std::string &msg) {
     std::cerr << "[Client Error] " << msg << " (Code: " << code << ")"
@@ -104,7 +142,7 @@ void RunClient() {
     client.Start();
     std::cout << "[Client] Bound to port " << client.GetLocalPort()
               << std::endl;
-    if (!client.Connect("127.0.0.1", 4435)) {
+    if (!client.Connect("127.0.0.1", server_port)) {
       std::cerr << "[Client] Failed to connect." << std::endl;
       client.Stop();
       return;
@@ -141,24 +179,27 @@ void RunClient() {
     bool is_last = (i == TOTAL_PACKETS - 1);
 
     // Block until stream has budget for one packet
-    while (!client.CanSendOnStream(stream_id, PACKET_SIZE) &&
-           client.GetConnectionState() == ConnectionState::Connected) {
-      auto now = std::chrono::steady_clock::now();
-      if (now - last_print > std::chrono::seconds(1)) {
-        auto conn = client.GetConnection();
-        if (conn) {
-          auto stream = conn->GetStream(stream_id);
-          if (stream) {
-            std::cout << "[Client Debug] Blocked at packet " << i
-                      << ". Stream offset: " << stream->GetSendOffset() << "/"
-                      << stream->GetMaxSendOffset()
-                      << ", Conn bytes: " << conn->GetTotalStreamBytesSent()
-                      << "/" << conn->GetMaxSendData() << std::endl;
+    {
+      std::unique_lock<std::mutex> lock(client_mutex);
+      while (!client.CanSendOnStream(stream_id, PACKET_SIZE) &&
+             client.GetConnectionState() == ConnectionState::Connected) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_print > std::chrono::seconds(1)) {
+          auto conn = client.GetConnection();
+          if (conn) {
+            auto stream = conn->GetStream(stream_id);
+            if (stream) {
+              std::cout << "[Client Debug] Blocked at packet " << i
+                        << ". Stream offset: " << stream->GetSendOffset() << "/"
+                        << stream->GetMaxSendOffset()
+                        << ", Conn bytes: " << conn->GetTotalStreamBytesSent()
+                        << "/" << conn->GetMaxSendData() << std::endl;
+            }
           }
+          last_print = now;
         }
-        last_print = now;
+        flow_control_cv.wait_for(lock, std::chrono::milliseconds(100));
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     if (client.GetConnectionState() != ConnectionState::Connected) {
@@ -174,9 +215,9 @@ void RunClient() {
     if (r > peak_recv) peak_recv = r;
 
     // Pacing delay to prevent OS socket buffer overflow and CPU saturation.
-    std::this_thread::sleep_for(use_backpressure
-                                    ? std::chrono::microseconds(1000)
-                                    : std::chrono::microseconds(500));
+    auto delay_per_packet = use_backpressure ? std::chrono::microseconds(1000)
+                                             : std::chrono::microseconds(500);
+    PreciseSleepUntil(transfer_start + (i + 1) * delay_per_packet);
   }
 
   std::cout << "[Client] All packets queued. Waiting for full echo..."
@@ -184,36 +225,30 @@ void RunClient() {
 
   // Wait until every byte is echoed back (or the connection drops)
   auto wait_start = std::chrono::steady_clock::now();
-  uint64_t last_echo = 0;
-  auto last_echo_time = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(client_mutex);
+    while (client_bytes_received.load() < TOTAL_BYTES &&
+           client.GetConnectionState() == ConnectionState::Connected) {
+      auto now = std::chrono::steady_clock::now();
 
-  while (client_bytes_received < TOTAL_BYTES &&
-         client.GetConnectionState() == ConnectionState::Connected) {
-    auto now = std::chrono::steady_clock::now();
+      // Hard overall timeout (2 minutes)
+      if (now - wait_start > std::chrono::seconds(120)) {
+        std::cerr << "[Client] Hard timeout waiting for echo." << std::endl;
+        break;
+      }
 
-    // Hard overall timeout (2 minutes)
-    if (now - wait_start > std::chrono::seconds(120)) {
-      std::cerr << "[Client] Hard timeout waiting for echo." << std::endl;
-      break;
+      if (client_data_cv.wait_for(lock, std::chrono::seconds(30)) ==
+          std::cv_status::timeout) {
+        std::cout << "[Client] No new echo bytes for 30 s. Stopping."
+                  << std::endl;
+        break;
+      }
+
+      double s = tracker.GetSendThroughputBytesPerSec();
+      double r = tracker.GetRecvThroughputBytesPerSec();
+      if (s > peak_send) peak_send = s;
+      if (r > peak_recv) peak_recv = r;
     }
-
-    // Progress-based timeout: 15 s without new bytes
-    uint64_t cur = client_bytes_received.load();
-    if (cur > last_echo) {
-      last_echo = cur;
-      last_echo_time = now;
-    } else if (cur > 0 && now - last_echo_time > std::chrono::seconds(30)) {
-      std::cout << "[Client] No new echo bytes for 30 s. Stopping."
-                << std::endl;
-      break;
-    }
-
-    double s = tracker.GetSendThroughputBytesPerSec();
-    double r = tracker.GetRecvThroughputBytesPerSec();
-    if (s > peak_send) peak_send = s;
-    if (r > peak_recv) peak_recv = r;
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
   auto transfer_end = std::chrono::steady_clock::now();
@@ -306,7 +341,11 @@ int main(int argc, char *argv[]) {
       });
 
   std::thread server_thread(RunServer);
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  {
+    std::unique_lock<std::mutex> lock(server_mutex);
+    server_startup_cv.wait_for(lock, std::chrono::seconds(5),
+                               [] { return server_listening; });
+  }
   std::thread client_thread(RunClient);
 
   client_thread.join();

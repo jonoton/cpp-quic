@@ -4,6 +4,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
+#include <mutex>
 
 #include "cppquic.hpp"
 
@@ -13,42 +15,76 @@ const size_t CHUNK_SIZE = 1000;
 
 int main() {
   // Start server in a thread
-  std::atomic<bool> server_ready{false};
+  std::mutex server_mutex;
+  std::condition_variable server_cv;
+  bool server_listening = false;
+  std::condition_variable server_connection_cv;
+  bool client_connected = false;
+  std::condition_variable server_data_cv;
+  uint16_t server_port = 0;
+
+  std::mutex client_mutex;
+  std::condition_variable client_data_cv;
+
   std::atomic<uint64_t> server_bytes_received{0};
 
   std::thread server_thread([&]() {
-    cppquic::QuicServer server(4434);
+    cppquic::QuicServer server(0);
+
+    server.SetConnectionHandler([&](std::shared_ptr<cppquic::QuicConnection>) {
+      std::lock_guard<std::mutex> lock(server_mutex);
+      client_connected = true;
+      server_connection_cv.notify_one();
+    });
+
+    // Subscribe to connection closed events to wake up the server thread
+    // instantly on client disconnect
+    cpppubsub::Worker event_worker;
+    auto sub = server.GetEventBroker().Subscribe<cppquic::ConnectionEvent>(
+        "connection_events");
+    event_worker.AddSubscription<cppquic::ConnectionEvent>(
+        sub, [&](const cppquic::ConnectionEvent &ev) {
+          if (ev.state == cppquic::ConnectionState::Closed) {
+            std::lock_guard<std::mutex> lock(server_mutex);
+            server_data_cv.notify_all();
+          }
+        });
+    event_worker.Start();
 
     server.SetStreamDataHandler(
-        [&server, &server_bytes_received](
-            std::shared_ptr<cppquic::QuicConnection> conn, uint64_t stream_id,
+        [&](std::shared_ptr<cppquic::QuicConnection> conn, uint64_t stream_id,
             const std::vector<uint8_t> &data, bool fin) {
           server_bytes_received += data.size();
-          // Echo back
           server.SendOnStream(conn, stream_id, data, fin);
+          server_data_cv.notify_one();
         });
 
     server.Start();
-    server_ready.store(true);
-    std::cout << "[Server] Listening on port 4434..." << std::endl;
+    {
+      std::lock_guard<std::mutex> lock(server_mutex);
+      server_port = server.GetLocalPort();
+      server_listening = true;
+    }
+    server_cv.notify_one();
+    std::cout << "[Server] Listening on port " << server_port << "..."
+              << std::endl;
 
-    auto start = std::chrono::steady_clock::now();
     // Wait for client to connect
-    while (server.GetActiveConnectionCount() == 0) {
-      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(10)) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    {
+      std::unique_lock<std::mutex> lock(server_mutex);
+      server_connection_cv.wait_for(lock, std::chrono::seconds(10),
+                                    [&] { return client_connected; });
     }
 
     // Wait for client to disconnect or timeout
-    auto last_activity = std::chrono::steady_clock::now();
-    while (server.GetActiveConnectionCount() > 0) {
-      if (std::chrono::steady_clock::now() - last_activity >
-          std::chrono::seconds(15)) {
-        break;
+    {
+      std::unique_lock<std::mutex> lock(server_mutex);
+      while (server.GetActiveConnectionCount() > 0) {
+        if (server_data_cv.wait_for(lock, std::chrono::seconds(15)) ==
+            std::cv_status::timeout) {
+          break;
+        }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     server.Stop();
@@ -56,25 +92,26 @@ int main() {
   });
 
   // Wait for server to be ready
-  while (!server_ready.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  {
+    std::unique_lock<std::mutex> lock(server_mutex);
+    server_cv.wait_for(lock, std::chrono::seconds(5),
+                       [&] { return server_listening; });
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // Client
   cppquic::QuicClient client;
   std::atomic<uint64_t> client_bytes_received{0};
 
   client.SetStreamDataHandler(
-      [&client_bytes_received](uint64_t stream_id,
-                               const std::vector<uint8_t> &data, bool fin) {
+      [&](uint64_t stream_id, const std::vector<uint8_t> &data, bool fin) {
         client_bytes_received += data.size();
+        client_data_cv.notify_one();
       });
 
   try {
     client.Start();
 
-    if (!client.Connect("127.0.0.1", 4434)) {
+    if (!client.Connect("127.0.0.1", server_port)) {
       std::cerr << "[Client] Failed to connect." << std::endl;
       server_thread.join();
       return 1;
@@ -97,7 +134,9 @@ int main() {
         bool is_last = (sent + CHUNK_SIZE >= BYTES_PER_STREAM);
         client.SendOnStream(stream_id, chunk, is_last);
       }
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      auto target_time = transfer_start + (sent / CHUNK_SIZE + 1) *
+                                              std::chrono::microseconds(100);
+      cppquic::PreciseSleepUntil(target_time);
     }
 
     std::cout << "[Client] All data sent. Waiting for echoes..." << std::endl;
@@ -105,12 +144,14 @@ int main() {
     // Wait for echo data
     uint64_t expected = NUM_STREAMS * BYTES_PER_STREAM;
     auto wait_start = std::chrono::steady_clock::now();
-    while (client_bytes_received < expected) {
-      if (std::chrono::steady_clock::now() - wait_start >
-          std::chrono::seconds(10)) {
-        break;
+    {
+      std::unique_lock<std::mutex> lock(client_mutex);
+      while (client_bytes_received < expected) {
+        if (client_data_cv.wait_for(lock, std::chrono::seconds(10)) ==
+            std::cv_status::timeout) {
+          break;
+        }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     auto transfer_end = std::chrono::steady_clock::now();

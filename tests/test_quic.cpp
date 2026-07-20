@@ -966,6 +966,46 @@ TEST(IntegrationTest, ClientServerHandshake) {
   server.Stop();
 }
 
+TEST(IntegrationTest, AsynchronousCallbacks) {
+  cppquic::QuicServer server(0);
+  std::atomic<std::thread::id> connection_handler_thread_id{};
+  std::atomic<std::thread::id> stream_handler_thread_id{};
+
+  server.SetConnectionHandler(
+      [&](std::shared_ptr<cppquic::QuicConnection> conn) {
+        connection_handler_thread_id.store(std::this_thread::get_id());
+      });
+
+  server.SetStreamDataHandler([&](std::shared_ptr<cppquic::QuicConnection> conn,
+                                  uint64_t stream_id,
+                                  const std::vector<uint8_t>& data, bool fin) {
+    stream_handler_thread_id.store(std::this_thread::get_id());
+  });
+
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  uint64_t stream_id = client.OpenStream(true);
+  client.SendOnStream(stream_id, "test");
+
+  EXPECT_TRUE(WaitFor(
+      [&]() { return stream_handler_thread_id.load() != std::thread::id{}; },
+      std::chrono::seconds(2)));
+
+  // Assert that both handlers were executed on different threads than the main
+  // thread
+  EXPECT_NE(connection_handler_thread_id.load(), std::this_thread::get_id());
+  EXPECT_NE(stream_handler_thread_id.load(), std::this_thread::get_id());
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
+
 TEST(IntegrationTest, EchoStream) {
   cppquic::QuicServer server(0);
 
@@ -1138,9 +1178,11 @@ TEST(ThroughputTrackerTest, MeasureThroughput) {
 
   uint64_t stream_id = client.OpenStream(true);
   std::vector<uint8_t> data(500, 'A');
+  auto transfer_start = std::chrono::steady_clock::now();
   for (int i = 0; i < 20; ++i) {
     client.SendOnStream(stream_id, data);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    cppquic::PreciseSleepUntil(transfer_start +
+                               (i + 1) * std::chrono::milliseconds(10));
   }
 
   EXPECT_TRUE(
@@ -1708,10 +1750,12 @@ TEST(IntegrationTest, ThroughputTransfer) {
   const uint64_t EXPECTED_BYTES = NUM_PACKETS * PACKET_SIZE;
   std::vector<uint8_t> payload(PACKET_SIZE, 'B');
 
+  auto transfer_start = std::chrono::steady_clock::now();
   for (size_t i = 0; i < NUM_PACKETS; ++i) {
     bool fin = (i == NUM_PACKETS - 1);
     client.SendOnStream(stream_id, payload, fin);
-    std::this_thread::sleep_for(std::chrono::microseconds(500));
+    cppquic::PreciseSleepUntil(transfer_start +
+                               (i + 1) * std::chrono::microseconds(500));
   }
 
   bool ok = WaitFor([&]() { return received_bytes.load() >= EXPECTED_BYTES; },
@@ -1753,17 +1797,24 @@ TEST(IntegrationTest, ThroughputStats) {
 
   uint64_t stream_id = client.OpenStream(true);
   std::vector<uint8_t> payload(1000, 'T');
+  auto transfer_start = std::chrono::steady_clock::now();
   for (int i = 0; i < 50; ++i) {
     client.SendOnStream(stream_id, payload);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    cppquic::PreciseSleepUntil(transfer_start +
+                               (i + 1) * std::chrono::milliseconds(2));
   }
 
   // Wait for some echo bytes to arrive, confirming bidirectional flow
   WaitFor([&]() { return received_bytes.load() > 0; }, std::chrono::seconds(5));
 
-  EXPECT_GT(tracker.GetSendThroughputBytesPerSec(), 0.0)
+  EXPECT_TRUE(
+      WaitFor([&]() { return tracker.GetSendThroughputBytesPerSec() > 0.0; },
+              std::chrono::seconds(5)))
       << "Send throughput should be non-zero";
-  EXPECT_GE(tracker.GetRecvThroughputBytesPerSec(), 0.0);
+  EXPECT_TRUE(
+      WaitFor([&]() { return tracker.GetRecvThroughputBytesPerSec() > 0.0; },
+              std::chrono::seconds(5)))
+      << "Recv throughput should be non-zero";
 
   client.Disconnect();
   client.Stop();
@@ -1816,11 +1867,13 @@ TEST(IntegrationTest, PacketReliability) {
   const uint64_t TOTAL_BYTES = NUM_PACKETS * PACKET_SIZE;
   std::vector<uint8_t> payload(PACKET_SIZE, 0xAB);
 
+  auto transfer_start = std::chrono::steady_clock::now();
   for (size_t i = 0; i < NUM_PACKETS; ++i) {
     bool fin = (i == NUM_PACKETS - 1);
     client.SendOnStream(stream_id, payload, fin);
     // Small inter-packet delay so the congestion window keeps up
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    cppquic::PreciseSleepUntil(transfer_start +
+                               (i + 1) * std::chrono::milliseconds(1));
   }
 
   // All bytes must arrive at the server and be echoed back

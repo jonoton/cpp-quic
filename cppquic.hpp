@@ -19,15 +19,18 @@
 #include <vector>
 
 #include "cppudpnet.hpp"
+#include "cpppubsub.hpp"
+#include "cppasyncworker.hpp"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/x509.h>
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 6;
+constexpr int VERSION_MINOR = 7;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -57,6 +60,16 @@ enum class LogSeverity { Debug, Info, Warn, Error };
 using LogCallback =
     std::function<void(LogSeverity severity, const std::string &className,
                        const std::string &message)>;
+
+/**
+ * @brief Performs a high-precision, CPU-friendly yield sleep until a target
+ * time point is reached. Helpful for sub-millisecond pacing delays.
+ */
+inline void PreciseSleepUntil(std::chrono::steady_clock::time_point target) {
+  while (std::chrono::steady_clock::now() < target) {
+    std::this_thread::yield();
+  }
+}
 
 namespace internal {
 
@@ -651,7 +664,8 @@ enum class FrameType : uint8_t {
   RETIRE_CONNECTION_ID = 0x19,
   PATH_CHALLENGE = 0x1a,
   PATH_RESPONSE = 0x1b,
-  CONNECTION_CLOSE = 0x1c,  // 0x1c or 0x1d
+  CONNECTION_CLOSE = 0x1c,
+  CONNECTION_CLOSE_APP = 0x1d,
   HANDSHAKE_DONE = 0x1e,
 };
 
@@ -1200,8 +1214,9 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       if (!ReadVarInt(buf, len, offset, f.retire_prior_to)) return false;
       uint8_t cid_len = 0;
       if (!ReadUint8(buf, len, offset, cid_len)) return false;
-      if (cid_len != 8) return false;
-      if (!ConnectionId::Deserialize(buf, len, offset, f.connection_id))
+      if (cid_len < 1 || cid_len > 20) return false;
+      if (!ConnectionId::Deserialize(buf, len, offset, f.connection_id,
+                                     cid_len))
         return false;
       if (offset + 16 > len) return false;
       f.stateless_reset_token.assign(buf + offset, buf + offset + 16);
@@ -1231,11 +1246,14 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       out = std::move(f);
       return true;
     }
-    case FrameType::CONNECTION_CLOSE: {
+    case FrameType::CONNECTION_CLOSE:
+    case FrameType::CONNECTION_CLOSE_APP: {
       ConnectionCloseFrame f;
       if (!ReadVarInt(buf, len, offset, f.error_code)) return false;
-      uint64_t frame_type_close = 0;
-      if (!ReadVarInt(buf, len, offset, frame_type_close)) return false;
+      if (frame_type_raw == 0x1c) {
+        uint64_t frame_type_close = 0;
+        if (!ReadVarInt(buf, len, offset, frame_type_close)) return false;
+      }
       uint64_t reason_len = 0;
       if (!ReadVarInt(buf, len, offset, reason_len)) return false;
       if (offset + reason_len > len) return false;
@@ -1287,11 +1305,13 @@ int QuicAlpnSelectCallback(SSL *ssl, const unsigned char **out,
 
 void SetQuicTransportParams(SSL *ssl);
 
-inline SSL_CTX *GetSSLContext(bool is_server) {
+// Returns the shared singleton SSL_CTX for outgoing QUIC client connections.
+// Server-side connections always supply their own ssl_ctx_ via QuicServer,
+// so no server branch is needed here.
+inline SSL_CTX *GetClientSSLContext() {
   static std::mutex mtx;
   std::lock_guard<std::mutex> lock(mtx);
   static SSL_CTX *client_ctx = nullptr;
-  static SSL_CTX *server_ctx = nullptr;
   static bool initialized = false;
   if (!initialized) {
     SSL_library_init();
@@ -1299,29 +1319,13 @@ inline SSL_CTX *GetSSLContext(bool is_server) {
     SSL_load_error_strings();
     initialized = true;
   }
-  if (is_server) {
-    if (!server_ctx) {
-      server_ctx = SSL_CTX_new(TLS_server_method());
-      SSL_CTX_set_min_proto_version(server_ctx, TLS1_3_VERSION);
-      SSL_CTX_set_keylog_callback(server_ctx, QuicKeylogCallback);
-      SSL_CTX_set_quic_method(server_ctx, &quic_method);
-      SSL_CTX_set_dh_auto(server_ctx, 1);
-      SSL_CTX_set_alpn_select_cb(server_ctx, QuicAlpnSelectCallback, nullptr);
-      if (!GenerateSelfSignedCert(server_ctx)) {
-        Log(LogSeverity::Error, "GetSSLContext",
-            "Failed to generate self-signed certificate");
-      }
-    }
-    return server_ctx;
-  } else {
-    if (!client_ctx) {
-      client_ctx = SSL_CTX_new(TLS_client_method());
-      SSL_CTX_set_min_proto_version(client_ctx, TLS1_3_VERSION);
-      SSL_CTX_set_keylog_callback(client_ctx, QuicKeylogCallback);
-      SSL_CTX_set_quic_method(client_ctx, &quic_method);
-    }
-    return client_ctx;
+  if (!client_ctx) {
+    client_ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_min_proto_version(client_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_keylog_callback(client_ctx, QuicKeylogCallback);
+    SSL_CTX_set_quic_method(client_ctx, &quic_method);
   }
+  return client_ctx;
 }
 
 inline void DeriveInitialKeys(const ConnectionId &dest_conn_id, bool is_server,
@@ -2478,7 +2482,7 @@ class QuicConnection {
         is_server_(is_server),
         original_destination_connection_id_(original_dest_id) {
     crypto_ctx_ = std::make_shared<QuicCryptoContext>();
-    SSL_CTX *ctx = custom_ctx ? custom_ctx : internal::GetSSLContext(is_server);
+    SSL_CTX *ctx = custom_ctx ? custom_ctx : internal::GetClientSSLContext();
     crypto_ctx_->ssl = SSL_new(ctx);
     SSL_set_app_data(crypto_ctx_->ssl, this);
     internal::SetQuicTransportParams(crypto_ctx_->ssl);
@@ -2847,13 +2851,15 @@ class QuicConnection {
     return bytes;
   }
 
-  bool DeserializePacket(const std::vector<uint8_t> &data, QuicPacket &out) {
+  bool DeserializePacket(const std::vector<uint8_t> &data, QuicPacket &out,
+                         bool &was_buffered) {
     std::lock_guard<std::mutex> lock(mtx_);
+    was_buffered = false;
     const std::vector<uint8_t> *read_key = nullptr;
     const std::vector<uint8_t> *read_iv = nullptr;
     const std::vector<uint8_t> *read_hp = nullptr;
+    uint8_t packet_type = 0;
     if (crypto_ctx_) {
-      uint8_t packet_type = 0;
       if (!data.empty()) {
         uint8_t first = data[0];
         if (first & 0x80) {
@@ -2888,15 +2894,31 @@ class QuicConnection {
           read_iv = &crypto_ctx_->read_iv;
           read_hp = &crypto_ctx_->read_hp;
         } else {
-          read_key = &crypto_ctx_->initial_read_key;
-          read_iv = &crypto_ctx_->initial_read_iv;
-          read_hp = &crypto_ctx_->initial_read_hp;
+          // 1-RTT packet arrived before handshake is complete — buffer it
+          // for replay once 1-RTT keys are available (RFC 9001 §5.7).
+          pending_1rtt_packets_.push_back(data);
+          was_buffered = true;
+          return false;
         }
       }
     }
     uint8_t expected_len = local_connection_id_.length;
     return QuicPacket::Deserialize(data, out, read_key, read_iv, read_hp,
                                    expected_len);
+  }
+
+  bool DeserializePacket(const std::vector<uint8_t> &data, QuicPacket &out) {
+    bool was_buffered = false;
+    return DeserializePacket(data, out, was_buffered);
+  }
+
+  // Drains any 1-RTT packets buffered before handshake completed as raw UDP
+  // datagrams.
+  std::vector<std::vector<uint8_t>> DrainPending1RawPackets() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<std::vector<uint8_t>> result;
+    std::swap(result, pending_1rtt_packets_);
+    return result;
   }
 
   // Called for each received CryptoFrame. Performs in-order stream reassembly
@@ -3250,7 +3272,17 @@ class QuicConnection {
     stats.packets_sent = packets_sent_;
     stats.packets_received = packets_received_;
     stats.streams_opened = total_streams_opened_;
-    stats.streams_closed = total_streams_closed_;
+    if (state_ == ConnectionState::Closed) {
+      stats.streams_closed = total_streams_opened_;
+    } else {
+      uint64_t closed = 0;
+      for (const auto &[id, stream] : streams_) {
+        if (stream->GetState() == StreamState::Closed) {
+          closed++;
+        }
+      }
+      stats.streams_closed = closed;
+    }
     stats.retransmissions = retransmit_count_;
     return stats;
   }
@@ -3495,6 +3527,10 @@ class QuicConnection {
   std::vector<uint64_t> received_packets_[4];
   uint64_t largest_received_packet_[4] = {0, 0, 0, 0};
 
+  // Short-header (1-RTT) packets that arrived before handshake_complete.
+  // Replayed immediately after 1-RTT keys are available.
+  std::vector<std::vector<uint8_t>> pending_1rtt_packets_;
+
   // Stats
   uint64_t bytes_sent_ = 0;
   uint64_t bytes_received_ = 0;
@@ -3704,6 +3740,26 @@ inline void QuicKeylogCallback(const SSL *ssl, const char *line) {
  *
  * Uses `UdpListener` internally for UDP transport.
  */
+// ============================================================================
+// PubSub Events
+// ============================================================================
+
+struct QuicConnectionEvent {
+  std::shared_ptr<QuicConnection> connection;
+  ConnectionState state;
+};
+
+struct QuicStreamDataEvent {
+  std::shared_ptr<QuicConnection> connection;
+  uint64_t stream_id;
+  std::vector<uint8_t> data;
+  bool fin;
+};
+
+// ============================================================================
+// QuicServer
+// ============================================================================
+
 class QuicServer {
  public:
   /**
@@ -3716,6 +3772,13 @@ class QuicServer {
       : listener_(port, bind_address) {
     ssl_ctx_ = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+
+    uint8_t ticket_key[48];
+    if (RAND_bytes(ticket_key, sizeof(ticket_key)) == 1) {
+      SSL_CTX_set_tlsext_ticket_keys(ssl_ctx_, ticket_key, sizeof(ticket_key));
+    }
+    SSL_CTX_set_keylog_callback(ssl_ctx_, internal::QuicKeylogCallback);
     SSL_CTX_set_quic_method(ssl_ctx_, &internal::quic_method);
     SSL_CTX_set_dh_auto(ssl_ctx_, 1);
     alpn_wire_ = internal::SerializeAlpnProtos({"h3"});
@@ -3780,6 +3843,14 @@ class QuicServer {
   }
 
   /**
+   * @brief Sets the handler for flow-control updates.
+   */
+  void SetFlowControlHandler(
+      std::function<void(std::shared_ptr<QuicConnection>)> handler) {
+    flow_control_handler_ = std::move(handler);
+  }
+
+  /**
    * @brief Returns the number of active connections.
    */
   size_t GetActiveConnectionCount() const {
@@ -3792,9 +3863,46 @@ class QuicServer {
    * @throws std::runtime_error if already started.
    */
   void Start() {
-    if (running_.load()) {
+    bool expected = false;
+    if (!running_.compare_exchange_strong(expected, true)) {
       throw std::runtime_error("QuicServer already started");
     }
+
+    worker_pool_ = std::make_unique<cppasyncworker::WorkerPool>(
+        2, 0, [this](const std::exception_ptr &ex) {
+          try {
+            if (ex) std::rethrow_exception(ex);
+          } catch (const std::exception &e) {
+            if (error_handler_) error_handler_(0, e.what());
+          } catch (...) {
+            if (error_handler_)
+              error_handler_(0, "Unknown exception in worker pool");
+          }
+        });
+
+    conn_sub_ = broker_.Subscribe<QuicConnectionEvent>("connection_events");
+    event_worker_.AddSubscription(
+        conn_sub_, [this](const QuicConnectionEvent &ev) {
+          (void)worker_pool_->Enqueue([this, ev]() {
+            if (ev.state == ConnectionState::Connected && connection_handler_) {
+              connection_handler_(ev.connection);
+            }
+          });
+        });
+
+    stream_sub_ = broker_.Subscribe<QuicStreamDataEvent>("stream_data_events");
+    event_worker_.AddSubscription(
+        stream_sub_, [this](const QuicStreamDataEvent &ev) {
+          (void)worker_pool_->Enqueue([this, ev]() {
+            if (stream_data_handler_) {
+              stream_data_handler_(ev.connection, ev.stream_id, ev.data,
+                                   ev.fin);
+            }
+          });
+        });
+
+    event_worker_.SetTickCallback(std::chrono::milliseconds(10),
+                                  [this]() { MaintenanceLoopTick(); });
 
     listener_.SetDataHandler([this](uint64_t session_id,
                                     const cppudpnet::PeerAddress &peer,
@@ -3805,12 +3913,8 @@ class QuicServer {
       }
     });
 
+    event_worker_.Start();
     listener_.Start();
-    running_.store(true);
-
-    // Start retransmission and idle timeout checking thread
-    maintenance_thread_ = std::thread([this]() { MaintenanceLoop(); });
-
     internal::Log(LogSeverity::Info, "QuicServer", "Started");
   }
 
@@ -3818,28 +3922,21 @@ class QuicServer {
    * @brief Stops the QUIC server.
    */
   void Stop() {
-    if (!running_.load()) return;
-    running_.store(false);
-
-    if (maintenance_thread_.joinable()) {
-      maintenance_thread_.join();
+    if (!running_.exchange(false)) {
+      return;
     }
 
-    // Send CONNECTION_CLOSE to all active connections
-    {
-      std::lock_guard<std::mutex> lock(connections_mtx_);
-      for (auto &[id, conn] : connections_) {
-        if (conn->GetState() == ConnectionState::Connected) {
-          auto close_pkt = conn->CreateClosePacket(0, "Server shutting down");
-          auto bytes = conn->SerializePacket(close_pkt);
-          listener_.Send(conn->GetPeer(), bytes);
-          conn->SetState(ConnectionState::Closed);
-        }
-      }
-      connections_.clear();
-    }
-
+    event_worker_.Stop();
     listener_.Stop();
+
+    if (worker_pool_) {
+      worker_pool_.reset();
+    }
+
+    std::lock_guard<std::mutex> lock(connections_mtx_);
+    connections_.clear();
+    dcid_to_conn_.clear();
+
     internal::Log(LogSeverity::Info, "QuicServer", "Stopped");
   }
 
@@ -3872,6 +3969,13 @@ class QuicServer {
     std::lock_guard<std::mutex> lock(connections_mtx_);
     QuicStats total;
     total.active_connections = connections_.size();
+    total.bytes_sent = accum_bytes_sent_;
+    total.bytes_received = accum_bytes_received_;
+    total.packets_sent = accum_packets_sent_;
+    total.packets_received = accum_packets_received_;
+    total.streams_opened = accum_streams_opened_;
+    total.streams_closed = accum_streams_closed_;
+    total.retransmissions = accum_retransmissions_;
     for (const auto &[id, conn] : connections_) {
       auto cs = conn->GetStats();
       total.bytes_sent += cs.bytes_sent;
@@ -4019,9 +4123,12 @@ class QuicServer {
     QuicPacket pkt;
     bool packet_recorded = false;
     if (conn) {
-      if (!conn->DeserializePacket(data, pkt)) {
-        internal::Log(LogSeverity::Warn, "QuicServer",
-                      "Failed to deserialize packet from " + peer.ToString());
+      bool was_buffered = false;
+      if (!conn->DeserializePacket(data, pkt, was_buffered)) {
+        if (!was_buffered) {
+          internal::Log(LogSeverity::Warn, "QuicServer",
+                        "Failed to deserialize packet from " + peer.ToString());
+        }
         return;
       }
       conn->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
@@ -4095,11 +4202,20 @@ class QuicServer {
                   conn->SetState(ConnectionState::Connected);
                   internal::Log(LogSeverity::Info, "QuicServer",
                                 "Handshake complete. Server ready.");
+                  QuicConnectionEvent ev;
+                  ev.connection = conn;
+                  ev.state = ConnectionState::Connected;
+                  broker_.Publish("connection_events", ev);
+
                   event_broker_.Publish<ConnectionEvent>(
                       "connection_events", {conn->GetLocalConnectionId(), peer,
                                             ConnectionState::Connected});
-                  if (connection_handler_) {
-                    connection_handler_(conn);
+
+                  // Drain and replay any buffered raw 1-RTT packets now that
+                  // 1-RTT keys are ready
+                  auto pending = conn->DrainPending1RawPackets();
+                  for (const auto &raw_pkt : pending) {
+                    HandleIncomingPacket(peer, raw_pkt);
                   }
                 }
               } else {
@@ -4134,6 +4250,11 @@ class QuicServer {
               if (conn) {
                 conn->SetState(ConnectionState::Closed);
                 RemoveConnection(conn->GetLocalConnectionId());
+                QuicConnectionEvent ev;
+                ev.connection = conn;
+                ev.state = ConnectionState::Closed;
+                broker_.Publish("connection_events", ev);
+
                 event_broker_.Publish<ConnectionEvent>(
                     "connection_events", {conn->GetLocalConnectionId(), peer,
                                           ConnectionState::Closed});
@@ -4189,6 +4310,9 @@ class QuicServer {
                 conn->SetMaxSendData(f.max_data);
                 conn->GenerateStreamPackets();
                 SendPendingPackets(conn);
+                if (flow_control_handler_) {
+                  flow_control_handler_(conn);
+                }
               }
             } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
               if (conn) {
@@ -4198,6 +4322,9 @@ class QuicServer {
                   stream->SetMaxSendOffset(f.max_stream_data);
                   conn->GenerateStreamPackets();
                   SendPendingPackets(conn);
+                  if (flow_control_handler_) {
+                    flow_control_handler_(conn);
+                  }
                 }
               }
             }
@@ -4255,8 +4382,13 @@ class QuicServer {
       is_finished = stream->IsFinished();
     }
 
-    if (stream_data_handler_ && (!data.empty() || is_finished)) {
-      stream_data_handler_(conn, frame.stream_id, data, is_finished);
+    if (ok && (!data.empty() || is_finished)) {
+      QuicStreamDataEvent ev;
+      ev.connection = conn;
+      ev.stream_id = frame.stream_id;
+      ev.data = data;
+      ev.fin = is_finished;
+      broker_.Publish("stream_data_events", ev);
     }
 
     if (ok && conn->IsAutoFlowControlEnabled()) {
@@ -4293,54 +4425,71 @@ class QuicServer {
 
   void RemoveConnection(const ConnectionId &id) {
     std::lock_guard<std::mutex> lock(connections_mtx_);
-    connections_.erase(id);
+    auto it = connections_.find(id);
+    if (it != connections_.end()) {
+      auto cs = it->second->GetStats();
+      accum_bytes_sent_ += cs.bytes_sent;
+      accum_bytes_received_ += cs.bytes_received;
+      accum_packets_sent_ += cs.packets_sent;
+      accum_packets_received_ += cs.packets_received;
+      accum_streams_opened_ += cs.streams_opened;
+      accum_streams_closed_ += cs.streams_closed;
+      accum_retransmissions_ += cs.retransmissions;
+      connections_.erase(it);
+    }
   }
 
-  void MaintenanceLoop() {
-    while (running_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  void MaintenanceLoopTick() {
+    std::vector<std::shared_ptr<QuicConnection>> conns;
+    {
+      std::lock_guard<std::mutex> lock(connections_mtx_);
+      for (auto &[id, conn] : connections_) {
+        conns.push_back(conn);
+      }
+    }
 
-      std::vector<std::shared_ptr<QuicConnection>> conns;
-      {
-        std::lock_guard<std::mutex> lock(connections_mtx_);
-        for (auto &[id, conn] : connections_) {
-          conns.push_back(conn);
-        }
+    for (auto &conn : conns) {
+      if (conn->GetState() != ConnectionState::Connected &&
+          conn->GetState() != ConnectionState::Handshaking)
+        continue;
+
+      // Check idle timeout
+      if (conn->GetState() == ConnectionState::Connected &&
+          conn->IsIdle(idle_timeout_)) {
+        auto close_pkt = conn->CreateClosePacket(0, "Idle timeout");
+        auto bytes = conn->SerializePacket(close_pkt);
+        listener_.Send(conn->GetPeer(), bytes);
+        conn->SetState(ConnectionState::Closed);
+
+        internal::Log(LogSeverity::Info, "QuicServer",
+                      "Connection closed due to idle timeout");
+
+        QuicConnectionEvent ev;
+        ev.connection = conn;
+        ev.state = ConnectionState::Closed;
+        broker_.Publish("connection_events", ev);
+
+        event_broker_.Publish<ConnectionEvent>(
+            "connection_events", {conn->GetLocalConnectionId(), conn->GetPeer(),
+                                  ConnectionState::Closed});
+
+        RemoveConnection(conn->GetLocalConnectionId());
+        continue;
       }
 
-      for (auto &conn : conns) {
-        if (conn->GetState() != ConnectionState::Connected &&
-            conn->GetState() != ConnectionState::Handshaking)
-          continue;
-
-        // Check idle timeout
-        if (conn->GetState() == ConnectionState::Connected &&
-            conn->IsIdle(idle_timeout_)) {
-          auto close_pkt = conn->CreateClosePacket(0, "Idle timeout");
-          auto bytes = conn->SerializePacket(close_pkt);
-          listener_.Send(conn->GetPeer(), bytes);
-          conn->SetState(ConnectionState::Closed);
-
-          internal::Log(LogSeverity::Info, "QuicServer",
-                        "Connection closed due to idle timeout");
-
-          event_broker_.Publish<ConnectionEvent>(
-              "connection_events", {conn->GetLocalConnectionId(),
-                                    conn->GetPeer(), ConnectionState::Closed});
-
-          RemoveConnection(conn->GetLocalConnectionId());
-          continue;
-        }
-
-        // Process retransmissions with pacing
-        auto retransmits = conn->GetRetransmissions();  // uses RTT-based RTO
-        for (auto &pkt : retransmits) {
-          auto bytes = conn->SerializePacket(pkt);
-          conn->AddBytesSent(bytes.size());
-          listener_.Send(conn->GetPeer(), bytes);
-          std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
+      // Process retransmissions with pacing
+      auto retransmits = conn->GetRetransmissions();
+      auto send_time = std::chrono::steady_clock::now();
+      for (auto &pkt : retransmits) {
+        PreciseSleepUntil(send_time);
+        auto bytes = conn->SerializePacket(pkt);
+        conn->AddBytesSent(bytes.size());
+        listener_.Send(conn->GetPeer(), bytes);
+        send_time += std::chrono::microseconds(100);
       }
+
+      // Drain any pending packets that were blocked by congestion control
+      SendPendingPackets(conn);
     }
   }
 
@@ -4350,7 +4499,11 @@ class QuicServer {
   cpppubsub::PubSub event_broker_;
 
   std::atomic<bool> running_{false};
-  std::thread maintenance_thread_;
+  cpppubsub::PubSub broker_;
+  cpppubsub::Worker event_worker_;
+  std::unique_ptr<cppasyncworker::WorkerPool> worker_pool_;
+  std::shared_ptr<cpppubsub::Subscriber<QuicConnectionEvent>> conn_sub_;
+  std::shared_ptr<cpppubsub::Subscriber<QuicStreamDataEvent>> stream_sub_;
 
   mutable std::mutex connections_mtx_;
   std::unordered_map<ConnectionId, std::shared_ptr<QuicConnection>,
@@ -4367,6 +4520,16 @@ class QuicServer {
                      const std::vector<uint8_t> &, bool)>
       stream_data_handler_;
   std::function<void(int, const std::string &)> error_handler_;
+  std::function<void(std::shared_ptr<QuicConnection>)> flow_control_handler_;
+
+  // Accumulated historical stats from closed connections
+  uint64_t accum_bytes_sent_ = 0;
+  uint64_t accum_bytes_received_ = 0;
+  uint64_t accum_packets_sent_ = 0;
+  uint64_t accum_packets_received_ = 0;
+  uint64_t accum_streams_opened_ = 0;
+  uint64_t accum_streams_closed_ = 0;
+  uint64_t accum_retransmissions_ = 0;
 
   std::chrono::milliseconds idle_timeout_{60000};
   CongestionControlAlgorithm cc_algorithm_ =
@@ -4449,13 +4612,46 @@ class QuicClient {
   }
 
   /**
+   * @brief Sets the handler for flow-control updates.
+   */
+  void SetFlowControlHandler(std::function<void()> handler) {
+    flow_control_handler_ = std::move(handler);
+  }
+
+  /**
    * @brief Starts the client's underlying transport.
    * @throws std::runtime_error if already started.
    */
   void Start() {
-    if (running_.load()) {
+    bool expected = false;
+    if (!running_.compare_exchange_strong(expected, true)) {
       throw std::runtime_error("QuicClient already started");
     }
+
+    worker_pool_ = std::make_unique<cppasyncworker::WorkerPool>(
+        1, 0, [this](const std::exception_ptr &ex) {
+          try {
+            if (ex) std::rethrow_exception(ex);
+          } catch (const std::exception &e) {
+            if (error_handler_) error_handler_(0, e.what());
+          } catch (...) {
+            if (error_handler_)
+              error_handler_(0, "Unknown exception in worker pool");
+          }
+        });
+
+    stream_sub_ = broker_.Subscribe<QuicStreamDataEvent>("stream_data_events");
+    event_worker_.AddSubscription(
+        stream_sub_, [this](const QuicStreamDataEvent &ev) {
+          (void)worker_pool_->Enqueue([this, ev]() {
+            if (stream_data_handler_) {
+              stream_data_handler_(ev.stream_id, ev.data, ev.fin);
+            }
+          });
+        });
+
+    event_worker_.SetTickCallback(std::chrono::milliseconds(10),
+                                  [this]() { MaintenanceLoopTick(); });
 
     sender_.Bind(0);
 
@@ -4472,11 +4668,8 @@ class QuicClient {
                     msg + " (code: " + std::to_string(code) + ")");
     });
 
+    event_worker_.Start();
     sender_.Start();
-    running_.store(true);
-
-    // Start maintenance thread
-    maintenance_thread_ = std::thread([this]() { MaintenanceLoop(); });
 
     internal::Log(LogSeverity::Info, "QuicClient",
                   "Started on port " + std::to_string(sender_.GetLocalPort()));
@@ -4486,12 +4679,11 @@ class QuicClient {
    * @brief Stops the client.
    */
   void Stop() {
-    if (!running_.load()) return;
-    running_.store(false);
-
-    if (maintenance_thread_.joinable()) {
-      maintenance_thread_.join();
+    if (!running_.exchange(false)) {
+      return;
     }
+
+    event_worker_.Stop();
 
     // Send close to connection if active
     if (connection_ && connection_->GetState() == ConnectionState::Connected) {
@@ -4554,19 +4746,35 @@ class QuicClient {
         LogSeverity::Info, "QuicClient",
         "Sending ClientHello to " + host + ":" + std::to_string(port));
 
-    // Wait for handshake completion
-    auto start = std::chrono::steady_clock::now();
-    while (connection_->GetState() == ConnectionState::Handshaking) {
-      if (std::chrono::steady_clock::now() - start >
-          std::chrono::milliseconds(timeout_ms)) {
-        internal::Log(LogSeverity::Error, "QuicClient", "Handshake timed out");
-        connection_->SetState(ConnectionState::Closed);
-        return false;
+    // Wait for handshake completion using PubSub selector
+    auto sub = broker_.Subscribe<QuicConnectionEvent>("connection_events");
+    cpppubsub::Selector selector;
+    bool completed = false;
+    selector.Add(sub, [&](const QuicConnectionEvent &ev) {
+      if (ev.state == ConnectionState::Connected) {
+        completed = true;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+
+    auto start = std::chrono::steady_clock::now();
+    while (!completed &&
+           connection_->GetState() == ConnectionState::Handshaking) {
+      auto elapsed = std::chrono::steady_clock::now() - start;
+      auto rem = std::chrono::milliseconds(timeout_ms) -
+                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+      if (rem.count() <= 0) break;
+      selector.WaitFor(rem);
     }
 
-    return connection_->GetState() == ConnectionState::Connected;
+    if (!completed || connection_->GetState() != ConnectionState::Connected) {
+      if (connection_->GetState() == ConnectionState::Handshaking) {
+        internal::Log(LogSeverity::Error, "QuicClient", "Handshake timed out");
+        connection_->SetState(ConnectionState::Closed);
+      }
+      return false;
+    }
+
+    return true;
   }
 
   /**
@@ -4753,7 +4961,9 @@ class QuicClient {
 
     QuicPacket pkt;
     if (connection_) {
-      if (!connection_->DeserializePacket(data, pkt)) {
+      bool was_buffered = false;
+      if (!connection_->DeserializePacket(data, pkt, was_buffered)) {
+        if (was_buffered) return;  // Suppress warning, wait for replay
         if (data.size() >= 21) {
           uint8_t expected_token[16];
           internal::DeriveStatelessResetToken(
@@ -4824,6 +5034,18 @@ class QuicClient {
                   connection_->SetState(ConnectionState::Connected);
                   internal::Log(LogSeverity::Info, "QuicClient",
                                 "Handshake complete. Connected to server");
+
+                  QuicConnectionEvent ev;
+                  ev.connection = connection_;
+                  ev.state = ConnectionState::Connected;
+                  broker_.Publish("connection_events", ev);
+
+                  // Drain and replay any buffered raw 1-RTT packets now that
+                  // 1-RTT keys are ready
+                  auto pending = connection_->DrainPending1RawPackets();
+                  for (const auto &raw_pkt : pending) {
+                    HandleIncomingPacket(peer, raw_pkt);
+                  }
                 }
               }
             } else if constexpr (std::is_same_v<T, StreamFrame>) {
@@ -4845,8 +5067,13 @@ class QuicClient {
                   is_finished = stream->IsFinished();
                 }
 
-                if (stream_data_handler_ && (!data.empty() || is_finished)) {
-                  stream_data_handler_(f.stream_id, data, is_finished);
+                if (ok && (!data.empty() || is_finished)) {
+                  QuicStreamDataEvent ev;
+                  ev.connection = connection_;
+                  ev.stream_id = f.stream_id;
+                  ev.data = data;
+                  ev.fin = is_finished;
+                  broker_.Publish("stream_data_events", ev);
                 }
 
                 if (ok && connection_->IsAutoFlowControlEnabled()) {
@@ -4937,6 +5164,10 @@ class QuicClient {
                 connection_->SetMaxSendData(f.max_data);
                 connection_->GenerateStreamPackets();
                 SendPendingPackets();
+                if (flow_control_handler_) {
+                  (void)worker_pool_->Enqueue(
+                      [this]() { flow_control_handler_(); });
+                }
               }
             } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
               if (connection_) {
@@ -4946,6 +5177,10 @@ class QuicClient {
                   stream->SetMaxSendOffset(f.max_stream_data);
                   connection_->GenerateStreamPackets();
                   SendPendingPackets();
+                  if (flow_control_handler_) {
+                    (void)worker_pool_->Enqueue(
+                        [this]() { flow_control_handler_(); });
+                  }
                 }
               }
             } else if constexpr (std::is_same_v<T, HandshakeDoneFrame>) {
@@ -4976,26 +5211,26 @@ class QuicClient {
     sender_.Send(server_address_, bytes);
   }
 
-  void MaintenanceLoop() {
-    while (running_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-      if (!connection_ ||
-          (connection_->GetState() != ConnectionState::Connected &&
-           connection_->GetState() != ConnectionState::Handshaking)) {
-        continue;
-      }
-
-      // Process retransmissions with pacing
-      auto retransmits =
-          connection_->GetRetransmissions();  // uses RTT-based RTO
-      for (auto &pkt : retransmits) {
-        auto bytes = connection_->SerializePacket(pkt);
-        connection_->AddBytesSent(bytes.size());
-        sender_.Send(server_address_, bytes);
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-      }
+  void MaintenanceLoopTick() {
+    if (!connection_ ||
+        (connection_->GetState() != ConnectionState::Connected &&
+         connection_->GetState() != ConnectionState::Handshaking)) {
+      return;
     }
+
+    // Process retransmissions with pacing
+    auto retransmits = connection_->GetRetransmissions();
+    auto send_time = std::chrono::steady_clock::now();
+    for (auto &pkt : retransmits) {
+      PreciseSleepUntil(send_time);
+      auto bytes = connection_->SerializePacket(pkt);
+      connection_->AddBytesSent(bytes.size());
+      sender_.Send(server_address_, bytes);
+      send_time += std::chrono::microseconds(100);
+    }
+
+    // Drain any pending packets that were blocked by congestion control
+    SendPendingPackets();
   }
 
   SSL_CTX *ssl_ctx_ = nullptr;
@@ -5003,7 +5238,11 @@ class QuicClient {
   cppudpnet::UdpSender sender_;
 
   std::atomic<bool> running_{false};
-  std::thread maintenance_thread_;
+
+  cpppubsub::PubSub broker_;
+  cpppubsub::Worker event_worker_;
+  std::unique_ptr<cppasyncworker::WorkerPool> worker_pool_;
+  std::shared_ptr<cpppubsub::Subscriber<QuicStreamDataEvent>> stream_sub_;
 
   cppudpnet::PeerAddress server_address_;
   std::shared_ptr<QuicConnection> connection_;
@@ -5011,6 +5250,7 @@ class QuicClient {
   std::function<void(uint64_t, const std::vector<uint8_t> &, bool)>
       stream_data_handler_;
   std::function<void(int, const std::string &)> error_handler_;
+  std::function<void()> flow_control_handler_;
 
   CongestionControlAlgorithm cc_algorithm_ =
       CongestionControlAlgorithm::NewReno;
@@ -5040,6 +5280,7 @@ class ThroughputTracker {
 
   ~ThroughputTracker() {
     running_.store(false);
+    poll_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
   }
 
@@ -5098,7 +5339,10 @@ class ThroughputTracker {
         }
       }
 
-      std::this_thread::sleep_for(poll_interval_);
+      // Wait for poll_interval_, but wake immediately when destructor signals
+      std::unique_lock<std::mutex> lock(poll_cv_mtx_);
+      poll_cv_.wait_for(lock, poll_interval_,
+                        [this] { return !running_.load(); });
     }
   }
 
@@ -5106,6 +5350,8 @@ class ThroughputTracker {
   std::chrono::milliseconds poll_interval_;
   std::atomic<bool> running_{false};
   std::thread thread_;
+  std::mutex poll_cv_mtx_;
+  std::condition_variable poll_cv_;
 
   mutable std::mutex mtx_;
   std::deque<Sample> samples_;

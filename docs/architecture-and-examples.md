@@ -35,13 +35,16 @@ layout: default
 └─────────────────────────────────────────┘
 ```
 
-## Threading Model
+## Threading Model & Event Loop
 
-The library employs a multi-threaded architecture:
+`cpp-quic` is built around an event-driven architecture powered by `cpp-pubsub` and `cpp-asyncworker` to maximize performance and avoid blocking:
 
-1. **UDP Event Loop** (via `cpp-udpnet`): A background thread polls the UDP socket. Incoming datagrams are dispatched to worker threads.
-2. **Worker Pool** (via `cpp-asyncworker`): Datagrams are processed concurrently with peer affinity guarantees.
-3. **Maintenance Thread**: Each `QuicServer` and `QuicClient` runs a maintenance thread that handles retransmission, idle timeout detection, and connection cleanup.
+1. **I/O Polling Loop** (via `cpp-udpnet`): A background thread polls the UDP socket, reads incoming packets, processes the QUIC protocol layer, and publishes events (e.g., connection events, stream data events) to an internal event broker.
+2. **Event Worker Thread** (via `cpp-pubsub`): A background thread monitors the event broker, dispatches events to subscribers, and drives the protocol's maintenance ticks (running every 10ms to handle packet retransmissions, pacing, idle timeouts, and connection cleanup).
+3. **Asynchronous Callback Dispatch** (via `cpp-asyncworker`): Application-level callbacks (such as the connection handler, stream data handler, and flow control handler) are enqueued to an internal thread pool. This ensures that user code does not block the time-critical I/O or protocol maintenance loops.
+
+> [!WARNING]
+> Because application callbacks run asynchronously on thread pool threads, your callback code must be thread-safe when accessing shared application state.
 
 ### Packet Pipeline
 

@@ -128,9 +128,19 @@ To prevent application code from queuing more stream data than the current strea
 if (client.CanSendOnStream(stream_id, 1200)) {
     client.SendOnStream(stream_id, data);
 } else {
-    // Backpressure: window is full. Yield or delay sending.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Backpressure: window is full. Yield or integrate with an async event loop.
+    std::this_thread::yield();
 }
+```
+
+To be notified asynchronously when the flow control window opens up (e.g. after receiving `MAX_DATA` or `MAX_STREAM_DATA` updates from the server), you can register a flow control callback:
+
+```cpp
+client.SetFlowControlHandler([&]() {
+    // Notify your sending thread or resume sending
+    std::lock_guard<std::mutex> lock(client_mutex);
+    flow_control_cv.notify_all();
+});
 ```
 
 
