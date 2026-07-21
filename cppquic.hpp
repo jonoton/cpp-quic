@@ -41,7 +41,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 8;
+constexpr int VERSION_MINOR = 9;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -3186,6 +3186,12 @@ class QuicConnection {
     }
   }
 
+  size_t GetPendingAckCount(uint8_t packet_type) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (packet_type > 3) return 0;
+    return received_packets_[packet_type].size();
+  }
+
   /**
    * @brief Generates an ACK frame for received packets (locked context).
    */
@@ -4472,7 +4478,12 @@ class QuicServer {
     }
   }
 
-  void SendAck(std::shared_ptr<QuicConnection> conn, uint8_t packet_type) {
+  void SendAck(std::shared_ptr<QuicConnection> conn, uint8_t packet_type,
+               bool force = false) {
+    if (!force && packet_type == 3 &&
+        conn->GetPendingAckCount(packet_type) < 2) {
+      return;
+    }
     auto ack = conn->GenerateAck(packet_type);
     if (ack.acknowledged_packets.empty()) return;
     std::vector<QuicFrame> frames;
@@ -4513,7 +4524,6 @@ class QuicServer {
           conn->GetState() != ConnectionState::Handshaking)
         continue;
 
-      // Check idle timeout
       if (conn->GetState() == ConnectionState::Connected &&
           conn->IsIdle(idle_timeout_)) {
         auto close_pkt = conn->CreateClosePacket(0, "Idle timeout");
@@ -4536,6 +4546,9 @@ class QuicServer {
         RemoveConnection(conn->GetLocalConnectionId());
         continue;
       }
+
+      // Flush delayed ACKs
+      SendAck(conn, 3, true);
 
       // Process retransmissions
       auto retransmits = conn->GetRetransmissions();
@@ -5266,8 +5279,12 @@ class QuicClient {
     }
   }
 
-  void SendAck(uint8_t packet_type) {
+  void SendAck(uint8_t packet_type, bool force = false) {
     if (!connection_) return;
+    if (!force && packet_type == 3 &&
+        connection_->GetPendingAckCount(packet_type) < 2) {
+      return;
+    }
     auto ack = connection_->GenerateAck(packet_type);
     if (ack.acknowledged_packets.empty()) return;
     std::vector<QuicFrame> frames;
@@ -5284,6 +5301,9 @@ class QuicClient {
          connection_->GetState() != ConnectionState::Handshaking)) {
       return;
     }
+
+    // Flush delayed ACKs
+    SendAck(3, true);
 
     // Process retransmissions with pacing
     auto retransmits = connection_->GetRetransmissions();

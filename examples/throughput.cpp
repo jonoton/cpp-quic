@@ -33,6 +33,7 @@ const uint64_t TOTAL_BYTES = TOTAL_PACKETS * PACKET_SIZE;
 
 void RunServer() {
   QuicServer server(0);
+  server.SetQuicProfile(QuicProfile::HighThroughput());
   server.SetRecvBufferSize(16 * 1024 * 1024);
   server.SetSendBufferSize(16 * 1024 * 1024);
   server.SetIdleTimeout(std::chrono::milliseconds(120000));
@@ -118,6 +119,7 @@ void RunServer() {
 
 void RunClient() {
   QuicClient client;
+  client.SetQuicProfile(QuicProfile::HighThroughput());
   client.SetRecvBufferSize(16 * 1024 * 1024);
   client.SetSendBufferSize(16 * 1024 * 1024);
   client.SetCongestionControlAlgorithm(CongestionControlAlgorithm::NewReno);
