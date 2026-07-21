@@ -125,6 +125,18 @@ Configure the application-layer protocols supported by the server (default: `{"h
 server.SetAlpnProtos({"h3", "h3-29"});
 ```
 
+### QUIC Profile Configuration
+Apply optimized profile settings for transport parameters, congestion control, datagram limits, and underlying UDP listener profiles.
+
+```cpp
+// Apply high-throughput preset to server
+server.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+
+// Inspect active profile parameters
+const auto& profile = server.GetQuicProfile();
+std::cout << "Max stream data: " << profile.initial_max_stream_data << std::endl;
+```
+
 ### Idle Timeout
 Connections idle longer than the specified duration are automatically closed.
 

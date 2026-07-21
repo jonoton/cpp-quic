@@ -17,6 +17,7 @@
 - **Event-Driven:** Uses `cpp-pubsub` for connection and stream lifecycle events.
 - **Built-in Thread Pool:** Leverages `cpp-asyncworker` via `cpp-udpnet` for concurrent processing.
 - **Performance Metrics:** Track bytes/packets sent/received, streams, retransmissions, and throughput.
+- **QUIC Profiles:** Built-in performance preset profiles (`HighThroughput`, `HighLatency`, `LowBandwidth`, `ReliableLAN`, default) for automated congestion control, flow control windows, and socket buffer tuning.
 - **Dynamic Port Discovery:** Bind to port `0` for OS-assigned ephemeral ports.
 
 ## Integration
@@ -84,6 +85,21 @@ int main() {
     client.Stop();
     return 0;
 }
+```
+
+## QUIC Profiles
+
+Easily optimize stream flow control windows, congestion control algorithms, datagram size, and UDP socket options using preset profiles:
+
+```cpp
+// High Throughput Profile (CUBIC, 128 MB windows, HighThroughput UDP socket buffer)
+server.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+client.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+
+// Other available presets:
+// - QuicProfile::HighLatency()   (optimized for long-fat pipes)
+// - QuicProfile::LowBandwidth()   (NewReno, conservative 2 MB window limits)
+// - QuicProfile::ReliableLAN()    (1450-byte MTU, 32 MB max data)
 ```
 
 ## Documentation

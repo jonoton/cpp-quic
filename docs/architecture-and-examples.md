@@ -73,7 +73,7 @@ The `examples/` directory contains several complete, buildable programs:
 - **`server.cpp`**: Demonstrates setting up a `QuicServer`, accepting connections, handling stream data with echo logic, and subscribing to connection events.
 - **`client.cpp`**: Shows how to use `QuicClient` to connect to a server, open a bidirectional stream, and send/receive data.
 - **`stream_transfer.cpp`**: Demonstrates multi-stream concurrent data transfer with performance metrics.
-- **`throughput.cpp`**: Measures QUIC throughput with detailed metrics including retransmissions, peak/average throughput, and packet counts.
+- **`throughput.cpp`**: Measures QUIC throughput using `QuicProfile::HighThroughput()` with detailed metrics including retransmissions, peak/average throughput, backpressure mode, and packet counts.
 
 To build the examples, configure CMake from the project root:
 

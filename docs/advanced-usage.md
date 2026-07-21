@@ -245,6 +245,87 @@ if (conn) {
 }
 ```
 
+## QUIC Profiles & Performance Tuning
+
+`QuicProfile` encapsulates protocol flow control limits, congestion control algorithms, datagram MTU settings, stream limits, and underlying UDP transport socket profiles (`cppudpnet::UdpProfile`).
+
+### Profile Parameters
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `cc_algorithm` | `CongestionControlAlgorithm` | Congestion control algorithm (`Cubic`, `NewReno`, `ConstantWindow`) | `Cubic` |
+| `initial_cwnd` | `size_t` | Initial congestion window size (bytes) | `10 * 1200` (12 KB) |
+| `max_cwnd` | `size_t` | Maximum congestion window cap (bytes) | `16 MB` |
+| `max_datagram_size` | `size_t` | Maximum datagram payload size (bytes) | `1200` |
+| `initial_max_data` | `uint64_t` | Initial connection-level flow control receive window | `1 MB` |
+| `initial_max_stream_data` | `uint64_t` | Initial stream-level flow control receive window | `64 KB` |
+| `max_streams_bidi` | `uint64_t` | Initial limit on concurrent bidirectional streams | `100` |
+| `max_streams_uni` | `uint64_t` | Initial limit on concurrent unidirectional streams | `100` |
+| `ack_delay_exponent` | `uint64_t` | Exponent used to decode ACK Delay field | `3` |
+| `active_connection_id_limit` | `uint64_t` | Limit on active destination connection IDs | `2` |
+| `udp_profile` | `cppudpnet::UdpProfile` | Underneath socket buffer & I/O profile | Default UDP profile |
+
+### Preset Profiles
+
+`cpp-quic` provides factory methods for common networking environments:
+
+1. **`QuicProfile::HighThroughput()`**
+   - Ideal for high-speed local networks, bulk file transfers, and benchmarks.
+   - Initial CWND: `64 * 1200` (~76.8 KB), Max CWND: `128 MB`, Initial Max Data / Stream Data: `128 MB`.
+   - Max Streams: `1000` bidi / `1000` uni.
+   - UDP Profile: `cppudpnet::UdpProfile::HighThroughput()`.
+
+2. **`QuicProfile::HighLatency()`**
+   - Tuned for long-fat pipes (satellites, WANs, inter-datacenter links with high RTT).
+   - Datagram size: `1400` bytes, Initial CWND: `20 * 1400` (28 KB), Max CWND: `32 MB`.
+   - Initial Max Data / Stream Data: `64 MB`.
+   - UDP Profile: `cppudpnet::UdpProfile::HighLatency()`.
+
+3. **`QuicProfile::LowBandwidth()`**
+   - Designed for constrained, low-throughput, or cellular networks.
+   - Congestion Control: `NewReno`, Initial CWND: `4 * 1200` (4.8 KB), Max CWND: `2 MB`.
+   - Initial Max Data: `2 MB`, Initial Max Stream Data: `1 MB`, Max Streams: `10`.
+   - UDP Profile: `cppudpnet::UdpProfile::LowBandwidth()`.
+
+4. **`QuicProfile::ReliableLAN()`**
+   - Optimized for low-loss local area networks with high MTU.
+   - Datagram size: `1450` bytes, Initial CWND: `16 * 1450` (23.2 KB), Max CWND: `16 MB`.
+   - Initial Max Data: `32 MB`, Initial Max Stream Data: `16 MB`.
+   - UDP Profile: `cppudpnet::UdpProfile::ReliableLAN()`.
+
+### Applying Profiles
+
+Profiles can be configured on the server, client, or an active connection:
+
+```cpp
+// Set profile on server (applies to all future accepted connections)
+server.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+
+// Set profile on client (applies to connections initiated by this client)
+client.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+
+// Apply or update profile dynamically on an active QuicConnection
+auto conn = client.GetConnection();
+if (conn) {
+    conn->ApplyProfile(cppquic::QuicProfile::ReliableLAN());
+}
+```
+
+### Custom Profiles
+
+You can construct and customize a `QuicProfile` struct manually:
+
+```cpp
+cppquic::QuicProfile custom;
+custom.cc_algorithm = cppquic::CongestionControlAlgorithm::Cubic;
+custom.initial_cwnd = 32 * 1200;
+custom.max_cwnd = 64 * 1024 * 1024;
+custom.initial_max_data = 64 * 1024 * 1024;
+custom.initial_max_stream_data = 16 * 1024 * 1024;
+
+client.SetQuicProfile(custom);
+```
+
 ## Graceful Close
 
 To close a connection gracefully:

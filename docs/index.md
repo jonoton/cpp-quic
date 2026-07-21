@@ -20,6 +20,7 @@ layout: default
 - **Built-in Thread Pool:** Leverages `cpp-asyncworker` via `cpp-udpnet` for concurrent datagram processing with peer affinity.
 - **Dynamic Port Discovery:** Bind to port `0` and use `GetLocalPort()` to discover OS-assigned ports.
 - **Performance Metrics:** Track bytes/packets sent/received, streams opened/closed, retransmissions, and sliding-window throughput.
+- **QUIC Profiles:** Pre-configured performance profiles (`HighThroughput`, `HighLatency`, `LowBandwidth`, `ReliableLAN`) for flow control, congestion control, and transport tuning.
 - **Robust Error Handling:** Synchronous setup methods throw exceptions; asynchronous errors use callbacks and PubSub events.
 
 ### Documentation

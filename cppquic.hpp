@@ -41,7 +41,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 9;
+constexpr int VERSION_MINOR = 10;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -2605,8 +2605,8 @@ class QuicConnection {
         initial_id, is_server, crypto_ctx_->zerortt_read_key,
         crypto_ctx_->zerortt_read_iv, crypto_ctx_->zerortt_write_key,
         crypto_ctx_->zerortt_write_iv);
-    congestion_controller_ =
-        CreateCongestionController(CongestionControlAlgorithm::NewReno);
+    congestion_controller_ = CreateCongestionController(
+        profile.cc_algorithm, profile.max_datagram_size, profile.max_cwnd);
   }
 
   void HandleKeylogLine(const std::string &line) {

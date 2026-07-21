@@ -1966,3 +1966,150 @@ TEST(IntegrationTest, BackpressureFlowControl) {
   client.Stop();
   server.Stop();
 }
+
+// ============================================================================
+// QUIC Profile Tests
+// ============================================================================
+
+TEST(QuicProfileTest, DefaultProfileValues) {
+  cppquic::QuicProfile profile;
+  EXPECT_EQ(profile.cc_algorithm, cppquic::CongestionControlAlgorithm::Cubic);
+  EXPECT_EQ(profile.initial_cwnd, 10 * 1200u);
+  EXPECT_EQ(profile.max_cwnd, 16 * 1024 * 1024u);
+  EXPECT_EQ(profile.max_datagram_size, 1200u);
+  EXPECT_EQ(profile.initial_max_data, 1048576u);
+  EXPECT_EQ(profile.initial_max_stream_data, 65536u);
+  EXPECT_EQ(profile.max_streams_bidi, 100u);
+  EXPECT_EQ(profile.max_streams_uni, 100u);
+  EXPECT_EQ(profile.ack_delay_exponent, 3u);
+  EXPECT_EQ(profile.active_connection_id_limit, 2u);
+}
+
+TEST(QuicProfileTest, FactoryProfiles) {
+  // HighThroughput
+  auto ht = cppquic::QuicProfile::HighThroughput();
+  EXPECT_EQ(ht.cc_algorithm, cppquic::CongestionControlAlgorithm::Cubic);
+  EXPECT_EQ(ht.initial_cwnd, 64 * 1200u);
+  EXPECT_EQ(ht.max_cwnd, 128 * 1024 * 1024u);
+  EXPECT_EQ(ht.max_datagram_size, 1200u);
+  EXPECT_EQ(ht.initial_max_data, 128 * 1024 * 1024u);
+  EXPECT_EQ(ht.initial_max_stream_data, 128 * 1024 * 1024u);
+  EXPECT_EQ(ht.max_streams_bidi, 1000u);
+  EXPECT_EQ(ht.max_streams_uni, 1000u);
+
+  // HighLatency
+  auto hl = cppquic::QuicProfile::HighLatency();
+  EXPECT_EQ(hl.cc_algorithm, cppquic::CongestionControlAlgorithm::Cubic);
+  EXPECT_EQ(hl.initial_cwnd, 20 * 1400u);
+  EXPECT_EQ(hl.max_cwnd, 32 * 1024 * 1024u);
+  EXPECT_EQ(hl.max_datagram_size, 1400u);
+  EXPECT_EQ(hl.initial_max_data, 64 * 1024 * 1024u);
+  EXPECT_EQ(hl.initial_max_stream_data, 64 * 1024 * 1024u);
+
+  // LowBandwidth
+  auto lb = cppquic::QuicProfile::LowBandwidth();
+  EXPECT_EQ(lb.cc_algorithm, cppquic::CongestionControlAlgorithm::NewReno);
+  EXPECT_EQ(lb.initial_cwnd, 4 * 1200u);
+  EXPECT_EQ(lb.max_cwnd, 2 * 1024 * 1024u);
+  EXPECT_EQ(lb.max_datagram_size, 1200u);
+  EXPECT_EQ(lb.initial_max_data, 2 * 1024 * 1024u);
+  EXPECT_EQ(lb.initial_max_stream_data, 1 * 1024 * 1024u);
+  EXPECT_EQ(lb.max_streams_bidi, 10u);
+  EXPECT_EQ(lb.max_streams_uni, 10u);
+
+  // ReliableLAN
+  auto lan = cppquic::QuicProfile::ReliableLAN();
+  EXPECT_EQ(lan.cc_algorithm, cppquic::CongestionControlAlgorithm::Cubic);
+  EXPECT_EQ(lan.initial_cwnd, 16 * 1450u);
+  EXPECT_EQ(lan.max_cwnd, 16 * 1024 * 1024u);
+  EXPECT_EQ(lan.max_datagram_size, 1450u);
+  EXPECT_EQ(lan.initial_max_data, 32 * 1024 * 1024u);
+  EXPECT_EQ(lan.initial_max_stream_data, 16 * 1024 * 1024u);
+}
+
+TEST(QuicProfileTest, ApplyToConnection) {
+  cppquic::ConnectionId client_cid{1, 2, 3, 4, 5, 6, 7, 8};
+  cppquic::ConnectionId server_cid{8, 7, 6, 5, 4, 3, 2, 1};
+  cppudpnet::PeerAddress server_addr{"127.0.0.1", 22222};
+
+  auto ht_profile = cppquic::QuicProfile::HighThroughput();
+  cppquic::QuicConnection conn(client_cid, server_cid, server_addr, false,
+                               nullptr, cppquic::ConnectionId{}, {"h3"},
+                               ht_profile);
+
+  EXPECT_EQ(conn.GetProfile().initial_max_data, ht_profile.initial_max_data);
+  EXPECT_EQ(conn.GetMaxSendData(), ht_profile.initial_max_data);
+  ASSERT_NE(conn.GetCongestionController(), nullptr);
+  EXPECT_EQ(conn.GetCongestionController()->GetName(), "Cubic");
+
+  auto lb_profile = cppquic::QuicProfile::LowBandwidth();
+  conn.ApplyProfile(lb_profile);
+
+  EXPECT_EQ(conn.GetProfile().initial_max_data, lb_profile.initial_max_data);
+  EXPECT_EQ(conn.GetMaxSendData(), lb_profile.initial_max_data);
+  ASSERT_NE(conn.GetCongestionController(), nullptr);
+  EXPECT_EQ(conn.GetCongestionController()->GetName(), "NewReno");
+}
+
+TEST(QuicProfileTest, ServerAndClientProfileConfiguration) {
+  cppquic::QuicServer server(0);
+  auto server_prof = cppquic::QuicProfile::HighThroughput();
+  server.SetQuicProfile(server_prof);
+  EXPECT_EQ(server.GetQuicProfile().initial_max_data,
+            server_prof.initial_max_data);
+
+  cppquic::QuicClient client;
+  auto client_prof = cppquic::QuicProfile::LowBandwidth();
+  client.SetQuicProfile(client_prof);
+  EXPECT_EQ(client.GetQuicProfile().initial_max_data,
+            client_prof.initial_max_data);
+  EXPECT_EQ(client.GetQuicProfile().cc_algorithm,
+            cppquic::CongestionControlAlgorithm::NewReno);
+}
+
+TEST(QuicProfileTest, IntegrationWithProfiles) {
+  cppquic::QuicServer server(0);
+  server.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+  server.SetStreamDataHandler(
+      [&server](std::shared_ptr<cppquic::QuicConnection> conn,
+                uint64_t stream_id, const std::vector<uint8_t>& data,
+                bool fin) { server.SendOnStream(conn, stream_id, data, fin); });
+
+  server.Start();
+  uint16_t port = server.GetLocalPort();
+
+  cppquic::QuicClient client;
+  client.SetQuicProfile(cppquic::QuicProfile::HighThroughput());
+
+  std::vector<uint8_t> received_data;
+  std::atomic<bool> response_received{false};
+
+  client.SetStreamDataHandler(
+      [&received_data, &response_received](
+          uint64_t, const std::vector<uint8_t>& data, bool) {
+        received_data = data;
+        response_received.store(true);
+      });
+
+  client.Start();
+  ASSERT_TRUE(client.Connect("127.0.0.1", port));
+
+  auto conn = client.GetConnection();
+  ASSERT_NE(conn, nullptr);
+  EXPECT_EQ(conn->GetProfile().initial_max_data,
+            cppquic::QuicProfile::HighThroughput().initial_max_data);
+
+  uint64_t stream_id = client.OpenStream(true);
+  std::vector<uint8_t> payload = {'P', 'r', 'o', 'f', 'i', 'l',
+                                  'e', 'T', 'e', 's', 't'};
+  client.SendOnStream(stream_id, payload, true);
+
+  bool ok = WaitFor([&]() { return response_received.load(); },
+                    std::chrono::seconds(5));
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(received_data, payload);
+
+  client.Disconnect();
+  client.Stop();
+  server.Stop();
+}
