@@ -22,6 +22,17 @@
 #include "cpppubsub.hpp"
 #include "cppasyncworker.hpp"
 
+#ifdef _WIN32
+// Undefine conflicting WinCrypt macros that clash with OpenSSL names
+#undef X509_NAME
+#undef X509_EXTENSIONS
+#undef X509_CERT_TO_BE_SIGNED
+#undef PKCS7_ISSUER_AND_SERIAL
+#undef PKCS7_SIGNER_INFO
+#undef OCSP_REQUEST
+#undef OCSP_RESPONSE
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -30,7 +41,7 @@
 
 namespace cppquic {
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 7;
+constexpr int VERSION_MINOR = 8;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -158,6 +169,10 @@ inline bool DecryptData(const std::vector<uint8_t> &key,
                         const std::vector<uint8_t> &aad = {}) {
   if (ciphertext_with_tag.size() < 16) return false;
 
+  int ciphertext_len = ciphertext_with_tag.size() - 16;
+  void *tag_ptr =
+      const_cast<uint8_t *>(ciphertext_with_tag.data() + ciphertext_len);
+
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) return false;
 
@@ -175,6 +190,10 @@ inline bool DecryptData(const std::vector<uint8_t> &key,
     EVP_CIPHER_CTX_free(ctx);
     return false;
   }
+  if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag_ptr)) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
 
   if (!aad.empty()) {
     int outlen = 0;
@@ -184,7 +203,6 @@ inline bool DecryptData(const std::vector<uint8_t> &key,
     }
   }
 
-  int ciphertext_len = ciphertext_with_tag.size() - 16;
   plaintext_out.resize(ciphertext_len);
   int len = 0;
   int plaintext_len = 0;
@@ -195,13 +213,6 @@ inline bool DecryptData(const std::vector<uint8_t> &key,
     return false;
   }
   plaintext_len = len;
-
-  void *tag_ptr =
-      const_cast<uint8_t *>(ciphertext_with_tag.data() + ciphertext_len);
-  if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag_ptr)) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
 
   int ret = EVP_DecryptFinal_ex(ctx, plaintext_out.data() + len, &len);
   EVP_CIPHER_CTX_free(ctx);
@@ -1322,6 +1333,7 @@ inline SSL_CTX *GetClientSSLContext() {
   if (!client_ctx) {
     client_ctx = SSL_CTX_new(TLS_client_method());
     SSL_CTX_set_min_proto_version(client_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, nullptr);
     SSL_CTX_set_keylog_callback(client_ctx, QuicKeylogCallback);
     SSL_CTX_set_quic_method(client_ctx, &quic_method);
   }
@@ -1873,7 +1885,8 @@ class QuicStream {
         std::min(send_buffer_.size(), static_cast<size_t>(allowed));
 
     std::vector<StreamFrame> frames;
-    const size_t max_frame_data = 1200;  // Leave room for headers in MTU
+    const size_t max_frame_data =
+        1150;  // Leave room for headers and AEAD tag in 1200 MTU
     size_t data_offset = 0;
     size_t remaining = pull_size;
 
@@ -2140,6 +2153,74 @@ struct QuicStats {
 
 enum class CongestionControlAlgorithm { NewReno, Cubic, ConstantWindow };
 
+struct QuicProfile {
+  CongestionControlAlgorithm cc_algorithm = CongestionControlAlgorithm::Cubic;
+  size_t initial_cwnd = 10 * 1200;
+  size_t max_cwnd = 16 * 1024 * 1024;
+  size_t max_datagram_size = 1200;
+
+  uint64_t initial_max_data = 1048576;
+  uint64_t initial_max_stream_data = 65536;
+  uint64_t max_streams_bidi = 100;
+  uint64_t max_streams_uni = 100;
+  uint64_t ack_delay_exponent = 3;
+  uint64_t active_connection_id_limit = 2;
+
+  cppudpnet::UdpProfile udp_profile;
+
+  static QuicProfile HighThroughput() {
+    QuicProfile p;
+    p.cc_algorithm = CongestionControlAlgorithm::Cubic;
+    p.initial_cwnd = 64 * 1200;
+    p.max_cwnd = 128 * 1024 * 1024;
+    p.max_datagram_size = 1200;
+    p.initial_max_data = 128 * 1024 * 1024;
+    p.initial_max_stream_data = 128 * 1024 * 1024;
+    p.max_streams_bidi = 1000;
+    p.max_streams_uni = 1000;
+    p.udp_profile = cppudpnet::UdpProfile::HighThroughput();
+    return p;
+  }
+
+  static QuicProfile HighLatency() {
+    QuicProfile p;
+    p.cc_algorithm = CongestionControlAlgorithm::Cubic;
+    p.initial_cwnd = 20 * 1400;
+    p.max_cwnd = 32 * 1024 * 1024;
+    p.max_datagram_size = 1400;
+    p.initial_max_data = 64 * 1024 * 1024;
+    p.initial_max_stream_data = 64 * 1024 * 1024;
+    p.udp_profile = cppudpnet::UdpProfile::HighLatency();
+    return p;
+  }
+
+  static QuicProfile LowBandwidth() {
+    QuicProfile p;
+    p.cc_algorithm = CongestionControlAlgorithm::NewReno;
+    p.initial_cwnd = 4 * 1200;
+    p.max_cwnd = 2 * 1024 * 1024;
+    p.max_datagram_size = 1200;
+    p.initial_max_data = 2 * 1024 * 1024;
+    p.initial_max_stream_data = 1 * 1024 * 1024;
+    p.max_streams_bidi = 10;
+    p.max_streams_uni = 10;
+    p.udp_profile = cppudpnet::UdpProfile::LowBandwidth();
+    return p;
+  }
+
+  static QuicProfile ReliableLAN() {
+    QuicProfile p;
+    p.cc_algorithm = CongestionControlAlgorithm::Cubic;
+    p.initial_cwnd = 16 * 1450;
+    p.max_cwnd = 16 * 1024 * 1024;
+    p.max_datagram_size = 1450;
+    p.initial_max_data = 32 * 1024 * 1024;
+    p.initial_max_stream_data = 16 * 1024 * 1024;
+    p.udp_profile = cppudpnet::UdpProfile::ReliableLAN();
+    return p;
+  }
+};
+
 struct LostPacketInfo {
   uint64_t packet_number;
   size_t packet_size;
@@ -2165,8 +2246,10 @@ class CongestionController {
 
 class NewRenoCongestionController : public CongestionController {
  public:
-  explicit NewRenoCongestionController(size_t max_datagram_size = 1200)
+  explicit NewRenoCongestionController(size_t max_datagram_size = 1200,
+                                       size_t max_cwnd = 16 * 1024 * 1024)
       : max_datagram_size_(max_datagram_size),
+        max_cwnd_(max_cwnd),
         cwnd_(10 * max_datagram_size),
         ssthresh_(std::numeric_limits<size_t>::max()),
         bytes_in_flight_(0),
@@ -2198,7 +2281,7 @@ class NewRenoCongestionController : public CongestionController {
       cwnd_ += (max_datagram_size_ * acked_bytes) / cwnd_;
     }
 
-    const size_t MAX_CWND = 30 * max_datagram_size_;
+    const size_t MAX_CWND = max_cwnd_;
     if (cwnd_ > MAX_CWND) {
       cwnd_ = MAX_CWND;
     }
@@ -2237,6 +2320,7 @@ class NewRenoCongestionController : public CongestionController {
 
  private:
   size_t max_datagram_size_;
+  size_t max_cwnd_ = 16 * 1024 * 1024;
   size_t cwnd_;
   size_t ssthresh_;
   size_t bytes_in_flight_;
@@ -2245,8 +2329,10 @@ class NewRenoCongestionController : public CongestionController {
 
 class CubicCongestionController : public CongestionController {
  public:
-  explicit CubicCongestionController(size_t max_datagram_size = 1200)
+  explicit CubicCongestionController(size_t max_datagram_size = 1200,
+                                     size_t max_cwnd = 16 * 1024 * 1024)
       : max_datagram_size_(max_datagram_size),
+        max_cwnd_(max_cwnd),
         cwnd_(10 * max_datagram_size),
         ssthresh_(std::numeric_limits<size_t>::max()),
         bytes_in_flight_(0),
@@ -2345,6 +2431,7 @@ class CubicCongestionController : public CongestionController {
 
  private:
   size_t max_datagram_size_;
+  size_t max_cwnd_ = 16 * 1024 * 1024;
   size_t cwnd_;
   size_t ssthresh_;
   size_t bytes_in_flight_;
@@ -2401,17 +2488,20 @@ class ConstantWindowCongestionController : public CongestionController {
 };
 
 inline std::unique_ptr<CongestionController> CreateCongestionController(
-    CongestionControlAlgorithm algorithm, size_t max_datagram_size = 1200) {
+    CongestionControlAlgorithm algorithm, size_t max_datagram_size = 1200,
+    size_t max_cwnd = 16 * 1024 * 1024) {
   switch (algorithm) {
     case CongestionControlAlgorithm::NewReno:
-      return std::make_unique<NewRenoCongestionController>(max_datagram_size);
+      return std::make_unique<NewRenoCongestionController>(max_datagram_size,
+                                                           max_cwnd);
     case CongestionControlAlgorithm::Cubic:
-      return std::make_unique<CubicCongestionController>(max_datagram_size);
+      return std::make_unique<CubicCongestionController>(max_datagram_size,
+                                                         max_cwnd);
     case CongestionControlAlgorithm::ConstantWindow:
-      return std::make_unique<ConstantWindowCongestionController>(
-          max_datagram_size);
+      return std::make_unique<ConstantWindowCongestionController>(max_cwnd);
   }
-  return std::make_unique<NewRenoCongestionController>(max_datagram_size);
+  return std::make_unique<NewRenoCongestionController>(max_datagram_size,
+                                                       max_cwnd);
 }
 
 // ============================================================================
@@ -2475,12 +2565,18 @@ class QuicConnection {
                  const cppudpnet::PeerAddress &peer, bool is_server,
                  SSL_CTX *custom_ctx = nullptr,
                  const ConnectionId &original_dest_id = ConnectionId{},
-                 const std::vector<std::string> &alpn_protos = {"h3"})
+                 const std::vector<std::string> &alpn_protos = {"h3"},
+                 const QuicProfile &profile = QuicProfile{})
       : local_connection_id_(local_id),
         remote_connection_id_(remote_id),
         peer_(peer),
         is_server_(is_server),
-        original_destination_connection_id_(original_dest_id) {
+        original_destination_connection_id_(original_dest_id),
+        profile_(profile) {
+    congestion_controller_ = CreateCongestionController(
+        profile.cc_algorithm, profile.max_datagram_size, profile.max_cwnd);
+    max_send_data_ = profile.initial_max_data;
+
     crypto_ctx_ = std::make_shared<QuicCryptoContext>();
     SSL_CTX *ctx = custom_ctx ? custom_ctx : internal::GetClientSSLContext();
     crypto_ctx_->ssl = SSL_new(ctx);
@@ -2514,6 +2610,7 @@ class QuicConnection {
   }
 
   void HandleKeylogLine(const std::string &line) {
+    internal::Log(LogSeverity::Info, "QuicConnection", "Keylog line: " + line);
     std::vector<std::string> parts;
     std::string current;
     for (char c : line) {
@@ -2710,7 +2807,9 @@ class QuicConnection {
     auto it = streams_.find(stream_id);
     if (it != streams_.end()) return it->second;
 
-    auto stream = std::make_shared<QuicStream>(stream_id, recv_window_size_);
+    auto stream = std::make_shared<QuicStream>(
+        stream_id, profile_.initial_max_stream_data);
+    stream->SetMaxSendOffset(profile_.initial_max_stream_data);
     streams_[stream_id] = stream;
     total_streams_opened_++;
     return stream;
@@ -2828,7 +2927,7 @@ class QuicConnection {
         write_iv = &crypto_ctx_->zerortt_write_iv;
         write_hp = &crypto_ctx_->initial_write_hp;
       } else {
-        if (crypto_ctx_->handshake_complete) {
+        if (!crypto_ctx_->write_key.empty()) {
           write_key = &crypto_ctx_->write_key;
           write_iv = &crypto_ctx_->write_iv;
           write_hp = &crypto_ctx_->write_hp;
@@ -2889,7 +2988,7 @@ class QuicConnection {
         read_iv = &crypto_ctx_->zerortt_read_iv;
         read_hp = &crypto_ctx_->initial_read_hp;
       } else {
-        if (crypto_ctx_->handshake_complete) {
+        if (!crypto_ctx_->read_key.empty()) {
           read_key = &crypto_ctx_->read_key;
           read_iv = &crypto_ctx_->read_iv;
           read_hp = &crypto_ctx_->read_hp;
@@ -3036,48 +3135,6 @@ class QuicConnection {
     return pkts;
   }
 
-  void ExtractKeys() {
-    crypto_ctx_->read_key.resize(16);
-    crypto_ctx_->read_iv.resize(12);
-    crypto_ctx_->write_key.resize(16);
-    crypto_ctx_->write_iv.resize(12);
-
-    const char *client_label = "EXPORTER-QUIC client";
-    const char *server_label = "EXPORTER-QUIC server";
-
-    std::vector<uint8_t> client_secret(32);
-    std::vector<uint8_t> server_secret(32);
-
-    SSL_export_keying_material(crypto_ctx_->ssl, client_secret.data(), 32,
-                               client_label, strlen(client_label), nullptr, 0,
-                               0);
-    SSL_export_keying_material(crypto_ctx_->ssl, server_secret.data(), 32,
-                               server_label, strlen(server_label), nullptr, 0,
-                               0);
-
-    if (is_server_) {
-      crypto_ctx_->read_key =
-          internal::HKDF_Expand_Label(client_secret, "quic key", {}, 16);
-      crypto_ctx_->read_iv =
-          internal::HKDF_Expand_Label(client_secret, "quic iv", {}, 12);
-      crypto_ctx_->write_key =
-          internal::HKDF_Expand_Label(server_secret, "quic key", {}, 16);
-      crypto_ctx_->write_iv =
-          internal::HKDF_Expand_Label(server_secret, "quic iv", {}, 12);
-    } else {
-      crypto_ctx_->write_key =
-          internal::HKDF_Expand_Label(client_secret, "quic key", {}, 16);
-      crypto_ctx_->write_iv =
-          internal::HKDF_Expand_Label(client_secret, "quic iv", {}, 12);
-      crypto_ctx_->read_key =
-          internal::HKDF_Expand_Label(server_secret, "quic key", {}, 16);
-      crypto_ctx_->read_iv =
-          internal::HKDF_Expand_Label(server_secret, "quic iv", {}, 12);
-    }
-    internal::Log(LogSeverity::Info, "QuicConnection",
-                  "Handshake complete, 1-RTT keys derived via HKDF.");
-  }
-
   /**
    * @brief Processes a received ACK frame, removing acknowledged packets.
    * @return The number of newly acknowledged packets.
@@ -3202,12 +3259,6 @@ class QuicConnection {
         new_info.packet_size = it->second.packet_size;
         new_info.packet_type = pkt.packet_type;
 
-        // Update any existing mappings to point to the new packet number
-        for (auto &[old_pn, new_pn] : retransmitted_packets_) {
-          if (new_pn == pkt_num) {
-            new_pn = pkt.packet_number;
-          }
-        }
         retransmitted_packets_[pkt_num] = pkt.packet_number;
 
         // Remove old, add new
@@ -3344,6 +3395,16 @@ class QuicConnection {
     congestion_controller_ = CreateCongestionController(algorithm);
   }
 
+  void ApplyProfile(const QuicProfile &profile) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    profile_ = profile;
+    congestion_controller_ = CreateCongestionController(
+        profile.cc_algorithm, profile.max_datagram_size, profile.max_cwnd);
+    max_send_data_ = profile.initial_max_data;
+  }
+
+  const QuicProfile &GetProfile() const { return profile_; }
+
   /**
    * @brief Returns the active congestion controller, or nullptr if none.
    */
@@ -3407,7 +3468,7 @@ class QuicConnection {
 
   uint64_t GetMaxRecvData() const {
     std::lock_guard<std::mutex> lock(mtx_);
-    return 1048576 + total_stream_bytes_read_;
+    return profile_.initial_max_data + total_stream_bytes_read_;
   }
 
   void SetAutoFlowControl(bool enable) {
@@ -3516,7 +3577,7 @@ class QuicConnection {
   uint64_t next_packet_number_ = 0;
 
   // Sent packet tracking for retransmission
-  std::map<uint64_t, SentPacketInfo> sent_packets_;
+  std::unordered_map<uint64_t, SentPacketInfo> sent_packets_;
   std::unordered_map<uint64_t, uint64_t> retransmitted_packets_;
 
   // RTT estimation (RFC 9002 §5)
@@ -3544,6 +3605,7 @@ class QuicConnection {
   std::chrono::steady_clock::time_point last_activity_ =
       std::chrono::steady_clock::now();
 
+  QuicProfile profile_;
   std::unique_ptr<CongestionController> congestion_controller_;
   std::deque<std::vector<QuicFrame>> pending_packets_;
   std::map<int, std::vector<uint8_t>> pending_handshake_data_;
@@ -3710,14 +3772,15 @@ inline void SetQuicTransportParams(SSL *ssl) {
                 local_cid.data + local_cid.length);
 
   // 3. standard parameters
-  write_param(params, 0x03, 1048576);  // initial_max_data
-  write_param(params, 0x04, 1048576);  // initial_max_stream_data_bidi_local
-  write_param(params, 0x05, 1048576);  // initial_max_stream_data_bidi_remote
-  write_param(params, 0x06, 1048576);  // initial_max_stream_data_uni
-  write_param(params, 0x07, 100);      // initial_max_streams_bidi
-  write_param(params, 0x08, 100);      // initial_max_streams_uni
-  write_param(params, 0x09, 3);        // ack_delay_exponent
-  write_param(params, 0x0e, 2);        // active_connection_id_limit
+  const auto &p = conn->GetProfile();
+  write_param(params, 0x03, p.initial_max_data);
+  write_param(params, 0x04, p.initial_max_stream_data);
+  write_param(params, 0x05, p.initial_max_stream_data);
+  write_param(params, 0x06, p.initial_max_stream_data);
+  write_param(params, 0x07, p.max_streams_bidi);
+  write_param(params, 0x08, p.max_streams_uni);
+  write_param(params, 0x09, p.ack_delay_exponent);
+  write_param(params, 0x0e, p.active_connection_id_limit);
 
   SSL_set_quic_transport_params(ssl, params.data(), params.size());
 }
@@ -3781,7 +3844,7 @@ class QuicServer {
     SSL_CTX_set_keylog_callback(ssl_ctx_, internal::QuicKeylogCallback);
     SSL_CTX_set_quic_method(ssl_ctx_, &internal::quic_method);
     SSL_CTX_set_dh_auto(ssl_ctx_, 1);
-    alpn_wire_ = internal::SerializeAlpnProtos({"h3"});
+    alpn_wire_ = internal::SerializeAlpnProtos(alpn_protos_);
     SSL_CTX_set_alpn_select_cb(ssl_ctx_, internal::QuicAlpnSelectCallback,
                                &alpn_wire_);
     if (!internal::GenerateSelfSignedCert(ssl_ctx_)) {
@@ -3791,6 +3854,7 @@ class QuicServer {
   }
 
   void SetAlpnProtos(const std::vector<std::string> &protos) {
+    alpn_protos_ = protos;
     alpn_wire_ = internal::SerializeAlpnProtos(protos);
     SSL_CTX_set_alpn_select_cb(ssl_ctx_, internal::QuicAlpnSelectCallback,
                                &alpn_wire_);
@@ -3893,12 +3957,9 @@ class QuicServer {
     stream_sub_ = broker_.Subscribe<QuicStreamDataEvent>("stream_data_events");
     event_worker_.AddSubscription(
         stream_sub_, [this](const QuicStreamDataEvent &ev) {
-          (void)worker_pool_->Enqueue([this, ev]() {
-            if (stream_data_handler_) {
-              stream_data_handler_(ev.connection, ev.stream_id, ev.data,
-                                   ev.fin);
-            }
-          });
+          if (stream_data_handler_) {
+            stream_data_handler_(ev.connection, ev.stream_id, ev.data, ev.fin);
+          }
         });
 
     event_worker_.SetTickCallback(std::chrono::milliseconds(10),
@@ -3996,8 +4057,7 @@ class QuicServer {
     if (!conn) return;
     while (conn->HasPendingPackets() && conn->CanSend(1200)) {
       auto frames = conn->PopPendingPacket();
-      uint8_t pkt_type =
-          (conn->GetState() == ConnectionState::Handshaking) ? 3 : 0;
+      uint8_t pkt_type = 0;
       auto pkt = conn->CreatePacket(std::move(frames), pkt_type);
       auto bytes = conn->SerializePacket(pkt);
       conn->AddBytesSent(bytes.size());
@@ -4239,6 +4299,7 @@ class QuicServer {
               if (conn) {
                 conn->Touch();
                 conn->ProcessAck(f);
+                conn->GenerateStreamPackets();
                 SendPendingPackets(conn);
               }
             } else if constexpr (std::is_same_v<T, PingFrame>) {
@@ -4343,8 +4404,8 @@ class QuicServer {
     // RFC 9001 §5.2: initial keys must be derived from the client's original
     // Destination Connection ID (dest_id), not from the server's generated IDs.
     auto conn = std::make_shared<QuicConnection>(local_id, remote_id, peer,
-                                                 true, ssl_ctx_, dest_id);
-    conn->SetCongestionControlAlgorithm(cc_algorithm_);
+                                                 true, ssl_ctx_, dest_id,
+                                                 alpn_protos_, profile_);
     conn->SetAutoFlowControl(auto_flow_control_);
     conn->SetState(ConnectionState::Handshaking);
 
@@ -4389,26 +4450,25 @@ class QuicServer {
       ev.data = data;
       ev.fin = is_finished;
       broker_.Publish("stream_data_events", ev);
-    }
 
-    if (ok && conn->IsAutoFlowControlEnabled()) {
-      if (!data.empty()) {
-        conn->AddBytesRead(data.size());
+      if (conn->IsAutoFlowControlEnabled()) {
+        if (!data.empty() || stream->IsFinished()) {
+          MaxStreamDataFrame max_stream;
+          max_stream.stream_id = frame.stream_id;
+          max_stream.max_stream_data = stream->GetMaxRecvOffset();
+
+          MaxDataFrame max_data;
+          max_data.max_data = conn->GetMaxRecvData();
+
+          std::vector<QuicFrame> frames;
+          frames.push_back(std::move(max_stream));
+          frames.push_back(std::move(max_data));
+          auto pkt = conn->CreatePacket(std::move(frames));
+          auto bytes = conn->SerializePacket(pkt);
+          conn->AddBytesSent(bytes.size());
+          listener_.Send(conn->GetPeer(), bytes);
+        }
       }
-      MaxStreamDataFrame max_stream;
-      max_stream.stream_id = frame.stream_id;
-      max_stream.max_stream_data = stream->GetMaxRecvOffset();
-
-      MaxDataFrame max_data;
-      max_data.max_data = conn->GetMaxRecvData();
-
-      std::vector<QuicFrame> frames;
-      frames.push_back(std::move(max_stream));
-      frames.push_back(std::move(max_data));
-      auto pkt = conn->CreatePacket(std::move(frames));
-      auto bytes = conn->SerializePacket(pkt);
-      conn->AddBytesSent(bytes.size());
-      listener_.Send(conn->GetPeer(), bytes);
     }
   }
 
@@ -4477,15 +4537,12 @@ class QuicServer {
         continue;
       }
 
-      // Process retransmissions with pacing
+      // Process retransmissions
       auto retransmits = conn->GetRetransmissions();
-      auto send_time = std::chrono::steady_clock::now();
       for (auto &pkt : retransmits) {
-        PreciseSleepUntil(send_time);
         auto bytes = conn->SerializePacket(pkt);
         conn->AddBytesSent(bytes.size());
         listener_.Send(conn->GetPeer(), bytes);
-        send_time += std::chrono::microseconds(100);
       }
 
       // Drain any pending packets that were blocked by congestion control
@@ -4494,6 +4551,7 @@ class QuicServer {
   }
 
   SSL_CTX *ssl_ctx_ = nullptr;
+  std::vector<std::string> alpn_protos_ = {"h3"};
   std::vector<uint8_t> alpn_wire_;
   cppudpnet::UdpListener listener_;
   cpppubsub::PubSub event_broker_;
@@ -4532,9 +4590,17 @@ class QuicServer {
   uint64_t accum_retransmissions_ = 0;
 
   std::chrono::milliseconds idle_timeout_{60000};
-  CongestionControlAlgorithm cc_algorithm_ =
-      CongestionControlAlgorithm::NewReno;
+  CongestionControlAlgorithm cc_algorithm_ = CongestionControlAlgorithm::Cubic;
   bool auto_flow_control_ = true;
+  QuicProfile profile_;
+
+ public:
+  void SetQuicProfile(const QuicProfile &profile) {
+    profile_ = profile;
+    cc_algorithm_ = profile.cc_algorithm;
+    listener_.ApplyProfile(profile.udp_profile);
+  }
+  const QuicProfile &GetQuicProfile() const { return profile_; }
 };
 
 // ============================================================================
@@ -4552,6 +4618,7 @@ class QuicClient {
     ssl_ctx_ = SSL_CTX_new(TLS_client_method());
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
     SSL_CTX_set_quic_method(ssl_ctx_, &internal::quic_method);
+    SSL_CTX_set_keylog_callback(ssl_ctx_, internal::QuicKeylogCallback);
     // Accept self-signed server certificates by default. Developers can supply
     // their own verified CA store via SSL_CTX_load_verify_locations if needed.
     SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_NONE, nullptr);
@@ -4643,11 +4710,9 @@ class QuicClient {
     stream_sub_ = broker_.Subscribe<QuicStreamDataEvent>("stream_data_events");
     event_worker_.AddSubscription(
         stream_sub_, [this](const QuicStreamDataEvent &ev) {
-          (void)worker_pool_->Enqueue([this, ev]() {
-            if (stream_data_handler_) {
-              stream_data_handler_(ev.stream_id, ev.data, ev.fin);
-            }
-          });
+          if (stream_data_handler_) {
+            stream_data_handler_(ev.stream_id, ev.data, ev.fin);
+          }
         });
 
     event_worker_.SetTickCallback(std::chrono::milliseconds(10),
@@ -4730,8 +4795,7 @@ class QuicClient {
 
     connection_ = std::make_shared<QuicConnection>(
         local_id, remote_id, server_address_, false, ssl_ctx_, ConnectionId{},
-        alpn_protos_);
-    connection_->SetCongestionControlAlgorithm(cc_algorithm_);
+        alpn_protos_, profile_);
     connection_->SetAutoFlowControl(auto_flow_control_);
     connection_->SetState(ConnectionState::Handshaking);
 
@@ -4838,8 +4902,7 @@ class QuicClient {
     if (!connection_) return;
     while (connection_->HasPendingPackets() && connection_->CanSend(1200)) {
       auto frames = connection_->PopPendingPacket();
-      uint8_t pkt_type =
-          (connection_->GetState() == ConnectionState::Handshaking) ? 3 : 0;
+      uint8_t pkt_type = 0;
       auto pkt = connection_->CreatePacket(std::move(frames), pkt_type);
       auto bytes = connection_->SerializePacket(pkt);
       connection_->AddBytesSent(bytes.size());
@@ -5074,32 +5137,36 @@ class QuicClient {
                   ev.data = data;
                   ev.fin = is_finished;
                   broker_.Publish("stream_data_events", ev);
-                }
 
-                if (ok && connection_->IsAutoFlowControlEnabled()) {
-                  if (!data.empty()) {
-                    connection_->AddBytesRead(data.size());
+                  if (ok && connection_->IsAutoFlowControlEnabled()) {
+                    if (!data.empty() || is_finished) {
+                      if (!data.empty()) {
+                        connection_->AddBytesRead(data.size());
+                      }
+                      MaxStreamDataFrame max_stream;
+                      max_stream.stream_id = f.stream_id;
+                      max_stream.max_stream_data = stream->GetMaxRecvOffset();
+
+                      MaxDataFrame max_data;
+                      max_data.max_data = connection_->GetMaxRecvData();
+
+                      std::vector<QuicFrame> frames;
+                      frames.push_back(std::move(max_stream));
+                      frames.push_back(std::move(max_data));
+                      auto pkt_out =
+                          connection_->CreatePacket(std::move(frames));
+                      auto bytes = connection_->SerializePacket(pkt_out);
+                      connection_->AddBytesSent(bytes.size());
+                      sender_.Send(server_address_, bytes);
+                    }
                   }
-                  MaxStreamDataFrame max_stream;
-                  max_stream.stream_id = f.stream_id;
-                  max_stream.max_stream_data = stream->GetMaxRecvOffset();
-
-                  MaxDataFrame max_data;
-                  max_data.max_data = connection_->GetMaxRecvData();
-
-                  std::vector<QuicFrame> frames;
-                  frames.push_back(std::move(max_stream));
-                  frames.push_back(std::move(max_data));
-                  auto pkt_out = connection_->CreatePacket(std::move(frames));
-                  auto bytes = connection_->SerializePacket(pkt_out);
-                  connection_->AddBytesSent(bytes.size());
-                  sender_.Send(server_address_, bytes);
                 }
               }
             } else if constexpr (std::is_same_v<T, AckFrame>) {
               if (connection_) {
                 connection_->Touch();
                 connection_->ProcessAck(f);
+                connection_->GenerateStreamPackets();
                 SendPendingPackets();
               }
             } else if constexpr (std::is_same_v<T, PingFrame>) {
@@ -5220,13 +5287,10 @@ class QuicClient {
 
     // Process retransmissions with pacing
     auto retransmits = connection_->GetRetransmissions();
-    auto send_time = std::chrono::steady_clock::now();
     for (auto &pkt : retransmits) {
-      PreciseSleepUntil(send_time);
       auto bytes = connection_->SerializePacket(pkt);
       connection_->AddBytesSent(bytes.size());
       sender_.Send(server_address_, bytes);
-      send_time += std::chrono::microseconds(100);
     }
 
     // Drain any pending packets that were blocked by congestion control
@@ -5252,9 +5316,17 @@ class QuicClient {
   std::function<void(int, const std::string &)> error_handler_;
   std::function<void()> flow_control_handler_;
 
-  CongestionControlAlgorithm cc_algorithm_ =
-      CongestionControlAlgorithm::NewReno;
+  CongestionControlAlgorithm cc_algorithm_ = CongestionControlAlgorithm::Cubic;
   bool auto_flow_control_ = true;
+  QuicProfile profile_;
+
+ public:
+  void SetQuicProfile(const QuicProfile &profile) {
+    profile_ = profile;
+    cc_algorithm_ = profile.cc_algorithm;
+    sender_.ApplyProfile(profile.udp_profile);
+  }
+  const QuicProfile &GetQuicProfile() const { return profile_; }
 };
 
 // ============================================================================
