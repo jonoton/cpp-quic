@@ -263,6 +263,8 @@ if (conn) {
 | `max_streams_uni` | `uint64_t` | Initial limit on concurrent unidirectional streams | `100` |
 | `ack_delay_exponent` | `uint64_t` | Exponent used to decode ACK Delay field | `3` |
 | `active_connection_id_limit` | `uint64_t` | Limit on active destination connection IDs | `2` |
+| `pacing_burst_packets` | `size_t` | Number of packets to send in a burst before applying pacing delay | `8` |
+| `pacing_delay_us` | `uint64_t` | Microseconds of pacing delay applied after each burst | `50` |
 | `udp_profile` | `cppudpnet::UdpProfile` | Underneath socket buffer & I/O profile | Default UDP profile |
 
 ### Preset Profiles
@@ -273,24 +275,28 @@ if (conn) {
    - Ideal for high-speed local networks, bulk file transfers, and benchmarks.
    - Initial CWND: `64 * 1200` (~76.8 KB), Max CWND: `128 MB`, Initial Max Data / Stream Data: `128 MB`.
    - Max Streams: `1000` bidi / `1000` uni.
+   - Pacing: Burst `8` packets, delay `50` us.
    - UDP Profile: `cppudpnet::UdpProfile::HighThroughput()`.
 
 2. **`QuicProfile::HighLatency()`**
    - Tuned for long-fat pipes (satellites, WANs, inter-datacenter links with high RTT).
    - Datagram size: `1400` bytes, Initial CWND: `20 * 1400` (28 KB), Max CWND: `32 MB`.
    - Initial Max Data / Stream Data: `64 MB`.
+   - Pacing: Burst `8` packets, delay `100` us.
    - UDP Profile: `cppudpnet::UdpProfile::HighLatency()`.
 
 3. **`QuicProfile::LowBandwidth()`**
    - Designed for constrained, low-throughput, or cellular networks.
    - Congestion Control: `NewReno`, Initial CWND: `4 * 1200` (4.8 KB), Max CWND: `2 MB`.
    - Initial Max Data: `2 MB`, Initial Max Stream Data: `1 MB`, Max Streams: `10`.
+   - Pacing: Burst `4` packets, delay `150` us.
    - UDP Profile: `cppudpnet::UdpProfile::LowBandwidth()`.
 
 4. **`QuicProfile::ReliableLAN()`**
    - Optimized for low-loss local area networks with high MTU.
    - Datagram size: `1450` bytes, Initial CWND: `16 * 1450` (23.2 KB), Max CWND: `16 MB`.
    - Initial Max Data: `32 MB`, Initial Max Stream Data: `16 MB`.
+   - Pacing: Burst `16` packets, delay `20` us.
    - UDP Profile: `cppudpnet::UdpProfile::ReliableLAN()`.
 
 ### Applying Profiles
@@ -322,6 +328,8 @@ custom.initial_cwnd = 32 * 1200;
 custom.max_cwnd = 64 * 1024 * 1024;
 custom.initial_max_data = 64 * 1024 * 1024;
 custom.initial_max_stream_data = 16 * 1024 * 1024;
+custom.pacing_burst_packets = 16;
+custom.pacing_delay_us = 10;
 
 client.SetQuicProfile(custom);
 ```

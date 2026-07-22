@@ -906,6 +906,12 @@ TEST(QuicServerTest, StatsInitiallyZero) {
   EXPECT_EQ(stats.active_connections, 0u);
 }
 
+TEST(QuicServerTest, StartAndStopWithRsaCert) {
+  cppquic::QuicServer server(0, "0.0.0.0", cppquic::SelfSignedCertType::RSA);
+  EXPECT_NO_THROW(server.Start());
+  EXPECT_NO_THROW(server.Stop());
+}
+
 // ============================================================================
 // QuicClient Tests
 // ============================================================================
@@ -1983,6 +1989,8 @@ TEST(QuicProfileTest, DefaultProfileValues) {
   EXPECT_EQ(profile.max_streams_uni, 100u);
   EXPECT_EQ(profile.ack_delay_exponent, 3u);
   EXPECT_EQ(profile.active_connection_id_limit, 2u);
+  EXPECT_EQ(profile.pacing_burst_packets, 8u);
+  EXPECT_EQ(profile.pacing_delay_us, 50u);
 }
 
 TEST(QuicProfileTest, FactoryProfiles) {
@@ -1996,6 +2004,8 @@ TEST(QuicProfileTest, FactoryProfiles) {
   EXPECT_EQ(ht.initial_max_stream_data, 128 * 1024 * 1024u);
   EXPECT_EQ(ht.max_streams_bidi, 1000u);
   EXPECT_EQ(ht.max_streams_uni, 1000u);
+  EXPECT_EQ(ht.pacing_burst_packets, 8u);
+  EXPECT_EQ(ht.pacing_delay_us, 50u);
 
   // HighLatency
   auto hl = cppquic::QuicProfile::HighLatency();
@@ -2005,6 +2015,8 @@ TEST(QuicProfileTest, FactoryProfiles) {
   EXPECT_EQ(hl.max_datagram_size, 1400u);
   EXPECT_EQ(hl.initial_max_data, 64 * 1024 * 1024u);
   EXPECT_EQ(hl.initial_max_stream_data, 64 * 1024 * 1024u);
+  EXPECT_EQ(hl.pacing_burst_packets, 8u);
+  EXPECT_EQ(hl.pacing_delay_us, 100u);
 
   // LowBandwidth
   auto lb = cppquic::QuicProfile::LowBandwidth();
@@ -2016,6 +2028,8 @@ TEST(QuicProfileTest, FactoryProfiles) {
   EXPECT_EQ(lb.initial_max_stream_data, 1 * 1024 * 1024u);
   EXPECT_EQ(lb.max_streams_bidi, 10u);
   EXPECT_EQ(lb.max_streams_uni, 10u);
+  EXPECT_EQ(lb.pacing_burst_packets, 4u);
+  EXPECT_EQ(lb.pacing_delay_us, 150u);
 
   // ReliableLAN
   auto lan = cppquic::QuicProfile::ReliableLAN();
@@ -2025,6 +2039,8 @@ TEST(QuicProfileTest, FactoryProfiles) {
   EXPECT_EQ(lan.max_datagram_size, 1450u);
   EXPECT_EQ(lan.initial_max_data, 32 * 1024 * 1024u);
   EXPECT_EQ(lan.initial_max_stream_data, 16 * 1024 * 1024u);
+  EXPECT_EQ(lan.pacing_burst_packets, 16u);
+  EXPECT_EQ(lan.pacing_delay_us, 20u);
 }
 
 TEST(QuicProfileTest, ApplyToConnection) {
@@ -2038,6 +2054,9 @@ TEST(QuicProfileTest, ApplyToConnection) {
                                ht_profile);
 
   EXPECT_EQ(conn.GetProfile().initial_max_data, ht_profile.initial_max_data);
+  EXPECT_EQ(conn.GetProfile().pacing_burst_packets,
+            ht_profile.pacing_burst_packets);
+  EXPECT_EQ(conn.GetProfile().pacing_delay_us, ht_profile.pacing_delay_us);
   EXPECT_EQ(conn.GetMaxSendData(), ht_profile.initial_max_data);
   ASSERT_NE(conn.GetCongestionController(), nullptr);
   EXPECT_EQ(conn.GetCongestionController()->GetName(), "Cubic");
@@ -2046,6 +2065,9 @@ TEST(QuicProfileTest, ApplyToConnection) {
   conn.ApplyProfile(lb_profile);
 
   EXPECT_EQ(conn.GetProfile().initial_max_data, lb_profile.initial_max_data);
+  EXPECT_EQ(conn.GetProfile().pacing_burst_packets,
+            lb_profile.pacing_burst_packets);
+  EXPECT_EQ(conn.GetProfile().pacing_delay_us, lb_profile.pacing_delay_us);
   EXPECT_EQ(conn.GetMaxSendData(), lb_profile.initial_max_data);
   ASSERT_NE(conn.GetCongestionController(), nullptr);
   EXPECT_EQ(conn.GetCongestionController()->GetName(), "NewReno");
@@ -2057,6 +2079,10 @@ TEST(QuicProfileTest, ServerAndClientProfileConfiguration) {
   server.SetQuicProfile(server_prof);
   EXPECT_EQ(server.GetQuicProfile().initial_max_data,
             server_prof.initial_max_data);
+  EXPECT_EQ(server.GetQuicProfile().pacing_burst_packets,
+            server_prof.pacing_burst_packets);
+  EXPECT_EQ(server.GetQuicProfile().pacing_delay_us,
+            server_prof.pacing_delay_us);
 
   cppquic::QuicClient client;
   auto client_prof = cppquic::QuicProfile::LowBandwidth();
@@ -2065,6 +2091,10 @@ TEST(QuicProfileTest, ServerAndClientProfileConfiguration) {
             client_prof.initial_max_data);
   EXPECT_EQ(client.GetQuicProfile().cc_algorithm,
             cppquic::CongestionControlAlgorithm::NewReno);
+  EXPECT_EQ(client.GetQuicProfile().pacing_burst_packets,
+            client_prof.pacing_burst_packets);
+  EXPECT_EQ(client.GetQuicProfile().pacing_delay_us,
+            client_prof.pacing_delay_us);
 }
 
 TEST(QuicProfileTest, IntegrationWithProfiles) {

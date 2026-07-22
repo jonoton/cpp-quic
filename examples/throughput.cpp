@@ -14,6 +14,9 @@ using namespace cppquic;
 std::atomic<uint64_t> server_bytes_received(0);
 std::atomic<uint64_t> client_bytes_received(0);
 bool use_backpressure = false;
+uint64_t flow_control_limit = 128 * 1024 * 1024;
+int pacing_us = 50;
+CongestionControlAlgorithm cc_algo = CongestionControlAlgorithm::Cubic;
 
 std::mutex server_mutex;
 std::condition_variable server_startup_cv;
@@ -33,11 +36,14 @@ const uint64_t TOTAL_BYTES = TOTAL_PACKETS * PACKET_SIZE;
 
 void RunServer() {
   QuicServer server(0);
-  server.SetQuicProfile(QuicProfile::HighThroughput());
+  auto profile = QuicProfile::HighThroughput();
+  profile.initial_max_data = flow_control_limit;
+  profile.initial_max_stream_data = flow_control_limit;
+  server.SetQuicProfile(profile);
   server.SetRecvBufferSize(16 * 1024 * 1024);
   server.SetSendBufferSize(16 * 1024 * 1024);
   server.SetIdleTimeout(std::chrono::milliseconds(120000));
-  server.SetCongestionControlAlgorithm(CongestionControlAlgorithm::NewReno);
+  server.SetCongestionControlAlgorithm(cc_algo);
 
   server.SetConnectionHandler([](std::shared_ptr<QuicConnection>) {
     std::lock_guard<std::mutex> lock(server_mutex);
@@ -88,9 +94,9 @@ void RunServer() {
   {
     std::unique_lock<std::mutex> lock(server_mutex);
     while (server_bytes_received.load() < TOTAL_BYTES) {
-      if (server_data_cv.wait_for(lock, std::chrono::seconds(30)) ==
+      if (server_data_cv.wait_for(lock, std::chrono::seconds(10)) ==
           std::cv_status::timeout) {
-        std::cout << "[Server] Stalled — no new data for 30 s. Stopping."
+        std::cout << "[Server] Stalled — no new data for 10 s. Stopping."
                   << std::endl;
         break;
       }
@@ -107,6 +113,27 @@ void RunServer() {
           std::chrono::seconds(10)) {
         std::cout << "[Server] Timeout waiting for client to disconnect."
                   << std::endl;
+        auto conns = server.GetConnections();
+        for (const auto &conn : conns) {
+          std::cout << "[Server Debug] cwnd: " << conn->GetCongestionWindow()
+                    << ", bytes_in_flight: " << conn->GetBytesInFlight()
+                    << ", max_send_data: " << conn->GetMaxSendData()
+                    << ", total_sent: " << conn->GetTotalStreamBytesSent()
+                    << ", pending_packets: " << conn->HasPendingPackets()
+                    << std::endl;
+          for (uint64_t id : {0, 1, 2, 3, 4}) {
+            auto stream = conn->GetStream(id);
+            if (stream) {
+              std::cout << "[Server Debug Stream " << id
+                        << "] send_offset: " << stream->GetSendOffset()
+                        << ", max_send_offset: " << stream->GetMaxSendOffset()
+                        << ", recv_offset: " << stream->GetRecvOffset()
+                        << ", max_recv_offset: " << stream->GetMaxRecvOffset()
+                        << ", send_buffer_pending: "
+                        << stream->GetSendBufferPendingSize() << std::endl;
+            }
+          }
+        }
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -119,10 +146,13 @@ void RunServer() {
 
 void RunClient() {
   QuicClient client;
-  client.SetQuicProfile(QuicProfile::HighThroughput());
+  auto profile = QuicProfile::HighThroughput();
+  profile.initial_max_data = flow_control_limit;
+  profile.initial_max_stream_data = flow_control_limit;
+  client.SetQuicProfile(profile);
   client.SetRecvBufferSize(16 * 1024 * 1024);
   client.SetSendBufferSize(16 * 1024 * 1024);
-  client.SetCongestionControlAlgorithm(CongestionControlAlgorithm::NewReno);
+  client.SetCongestionControlAlgorithm(cc_algo);
 
   client.SetStreamDataHandler(
       [](uint64_t, const std::vector<uint8_t> &data, bool) {
@@ -217,9 +247,12 @@ void RunClient() {
     if (r > peak_recv) peak_recv = r;
 
     // Pacing delay to prevent OS socket buffer overflow and CPU saturation.
-    auto delay_per_packet = use_backpressure ? std::chrono::microseconds(1000)
-                                             : std::chrono::microseconds(500);
-    PreciseSleepUntil(transfer_start + (i + 1) * delay_per_packet);
+    auto delay_per_packet = use_backpressure
+                                ? std::chrono::microseconds(100)
+                                : std::chrono::microseconds(pacing_us);
+    if (pacing_us > 0 || use_backpressure) {
+      PreciseSleepUntil(transfer_start + (i + 1) * delay_per_packet);
+    }
   }
 
   std::cout << "[Client] All packets queued. Waiting for full echo..."
@@ -239,10 +272,31 @@ void RunClient() {
         break;
       }
 
-      if (client_data_cv.wait_for(lock, std::chrono::seconds(30)) ==
+      if (client_data_cv.wait_for(lock, std::chrono::seconds(10)) ==
           std::cv_status::timeout) {
-        std::cout << "[Client] No new echo bytes for 30 s. Stopping."
+        std::cout << "[Client] No new echo bytes for 10 s. Stopping."
                   << std::endl;
+        auto conn = client.GetConnection();
+        if (conn) {
+          std::cout << "[Client Debug] State: "
+                    << static_cast<int>(client.GetConnectionState())
+                    << ", cwnd: " << conn->GetCongestionWindow()
+                    << ", bytes_in_flight: " << conn->GetBytesInFlight()
+                    << ", max_send_data: " << conn->GetMaxSendData()
+                    << ", total_sent: " << conn->GetTotalStreamBytesSent()
+                    << ", pending_packets: " << conn->HasPendingPackets()
+                    << std::endl;
+          auto stream = conn->GetStream(stream_id);
+          if (stream) {
+            std::cout << "[Client Debug Stream] send_offset: "
+                      << stream->GetSendOffset()
+                      << ", max_send_offset: " << stream->GetMaxSendOffset()
+                      << ", recv_offset: " << stream->GetRecvOffset()
+                      << ", max_recv_offset: " << stream->GetMaxRecvOffset()
+                      << ", send_buffer_pending: "
+                      << stream->GetSendBufferPendingSize() << std::endl;
+          }
+        }
         break;
       }
 
@@ -320,8 +374,32 @@ void RunClient() {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc > 1 && std::string(argv[1]) == "--backpressure") {
-    use_backpressure = true;
+  std::string cc_name = "Cubic";
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--backpressure") {
+      use_backpressure = true;
+    } else if (arg == "--pacing" && i + 1 < argc) {
+      pacing_us = std::stoi(argv[++i]);
+    } else if (arg == "--fc-size" && i + 1 < argc) {
+      flow_control_limit = std::stoull(argv[++i]);
+    } else if (arg == "--cc" && i + 1 < argc) {
+      std::string val = argv[++i];
+      if (val == "cubic") {
+        cc_algo = CongestionControlAlgorithm::Cubic;
+        cc_name = "Cubic";
+      } else if (val == "newreno") {
+        cc_algo = CongestionControlAlgorithm::NewReno;
+        cc_name = "NewReno";
+      } else if (val == "constant") {
+        cc_algo = CongestionControlAlgorithm::ConstantWindow;
+        cc_name = "ConstantWindow";
+      }
+    }
+  }
+
+  if (use_backpressure) {
+    pacing_us = 100;
     std::cout << "[Main] Using backpressure-paced packet transmission mode"
               << std::endl;
   } else {
@@ -330,6 +408,10 @@ int main(int argc, char *argv[]) {
     std::cout << "[Main] Tip: Run with '--backpressure' to test paced mode"
               << std::endl;
   }
+  auto sc = ScaleBytes(flow_control_limit);
+  std::cout << "[Main] Config: pacing=" << pacing_us
+            << "us, fc-size=" << sc.value << " " << sc.unit
+            << ", cc=" << cc_name << std::endl;
 
   // Only show flow-control and connection lifecycle messages to keep output
   // clean

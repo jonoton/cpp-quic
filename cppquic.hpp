@@ -40,8 +40,9 @@
 #include <openssl/x509.h>
 
 namespace cppquic {
+
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 10;
+constexpr int VERSION_MINOR = 11;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -81,6 +82,19 @@ inline void PreciseSleepUntil(std::chrono::steady_clock::time_point target) {
     std::this_thread::yield();
   }
 }
+
+/**
+ * @brief Performs a high-precision, CPU-friendly yield sleep for a given
+ * duration. Helpful for sub-millisecond pacing delays.
+ */
+inline void PreciseSleep(std::chrono::microseconds duration) {
+  PreciseSleepUntil(std::chrono::steady_clock::now() + duration);
+}
+
+enum class SelfSignedCertType {
+  ECDSA,  // Default: Modern, fast (prime256v1)
+  RSA     // Legacy: 2048-bit RSA
+};
 
 namespace internal {
 
@@ -399,18 +413,36 @@ inline bool ComputeHPMask(const std::vector<uint8_t> &hp_key,
 }
 
 // In-Memory Self-Signed Certificate Generation
-inline bool GenerateSelfSignedCert(SSL_CTX *ctx) {
+inline bool GenerateSelfSignedCert(
+    SSL_CTX *ctx, SelfSignedCertType type = SelfSignedCertType::ECDSA) {
   EVP_PKEY *pkey = nullptr;
-  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-  if (!pctx) return false;
-  if (EVP_PKEY_keygen_init(pctx) <= 0) {
-    EVP_PKEY_CTX_free(pctx);
-    return false;
+  EVP_PKEY_CTX *pctx = nullptr;
+
+  if (type == SelfSignedCertType::ECDSA) {
+    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    if (!pctx) return false;
+    if (EVP_PKEY_keygen_init(pctx) <= 0) {
+      EVP_PKEY_CTX_free(pctx);
+      return false;
+    }
+    if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <=
+        0) {
+      EVP_PKEY_CTX_free(pctx);
+      return false;
+    }
+  } else {
+    pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!pctx) return false;
+    if (EVP_PKEY_keygen_init(pctx) <= 0) {
+      EVP_PKEY_CTX_free(pctx);
+      return false;
+    }
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) <= 0) {
+      EVP_PKEY_CTX_free(pctx);
+      return false;
+    }
   }
-  if (EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) <= 0) {
-    EVP_PKEY_CTX_free(pctx);
-    return false;
-  }
+
   if (EVP_PKEY_keygen(pctx, &pkey) <= 0) {
     EVP_PKEY_CTX_free(pctx);
     return false;
@@ -1827,7 +1859,18 @@ class QuicStream {
       : stream_id_(stream_id),
         recv_window_(initial_recv_window),
         max_recv_offset_(initial_recv_window),
-        max_send_offset_(65536) {}
+        max_send_offset_(65536),
+        last_sent_max_recv_offset_(initial_recv_window) {}
+
+  bool ShouldSendMaxStreamData() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return max_recv_offset_ - last_sent_max_recv_offset_ >= recv_window_ / 4;
+  }
+
+  void UpdateLastSentMaxRecvOffset() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    last_sent_max_recv_offset_ = max_recv_offset_;
+  }
 
   uint64_t GetStreamId() const { return stream_id_; }
 
@@ -1886,7 +1929,7 @@ class QuicStream {
 
     std::vector<StreamFrame> frames;
     const size_t max_frame_data =
-        1150;  // Leave room for headers and AEAD tag in 1200 MTU
+        1120;  // Leave room for headers and AEAD tag in 1200 MTU
     size_t data_offset = 0;
     size_t remaining = pull_size;
 
@@ -2053,6 +2096,11 @@ class QuicStream {
     return send_buffer_.empty();
   }
 
+  size_t GetSendBufferPendingSize() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return send_buffer_.size();
+  }
+
  private:
   void FlushRecvBuffer() {
     while (true) {
@@ -2088,6 +2136,7 @@ class QuicStream {
   uint64_t recv_offset_ = 0;
   uint64_t recv_window_;
   uint64_t max_recv_offset_;
+  uint64_t last_sent_max_recv_offset_;
   std::map<uint64_t, std::vector<uint8_t>> recv_buffer_;  // offset -> data
   std::vector<uint8_t> read_buffer_;                      // contiguous data
 
@@ -2166,6 +2215,9 @@ struct QuicProfile {
   uint64_t ack_delay_exponent = 3;
   uint64_t active_connection_id_limit = 2;
 
+  size_t pacing_burst_packets = 8;
+  uint64_t pacing_delay_us = 50;
+
   cppudpnet::UdpProfile udp_profile;
 
   static QuicProfile HighThroughput() {
@@ -2178,6 +2230,8 @@ struct QuicProfile {
     p.initial_max_stream_data = 128 * 1024 * 1024;
     p.max_streams_bidi = 1000;
     p.max_streams_uni = 1000;
+    p.pacing_burst_packets = 8;
+    p.pacing_delay_us = 50;
     p.udp_profile = cppudpnet::UdpProfile::HighThroughput();
     return p;
   }
@@ -2190,6 +2244,8 @@ struct QuicProfile {
     p.max_datagram_size = 1400;
     p.initial_max_data = 64 * 1024 * 1024;
     p.initial_max_stream_data = 64 * 1024 * 1024;
+    p.pacing_burst_packets = 8;
+    p.pacing_delay_us = 100;
     p.udp_profile = cppudpnet::UdpProfile::HighLatency();
     return p;
   }
@@ -2204,6 +2260,8 @@ struct QuicProfile {
     p.initial_max_stream_data = 1 * 1024 * 1024;
     p.max_streams_bidi = 10;
     p.max_streams_uni = 10;
+    p.pacing_burst_packets = 4;
+    p.pacing_delay_us = 150;
     p.udp_profile = cppudpnet::UdpProfile::LowBandwidth();
     return p;
   }
@@ -2216,6 +2274,8 @@ struct QuicProfile {
     p.max_datagram_size = 1450;
     p.initial_max_data = 32 * 1024 * 1024;
     p.initial_max_stream_data = 16 * 1024 * 1024;
+    p.pacing_burst_packets = 16;
+    p.pacing_delay_us = 20;
     p.udp_profile = cppudpnet::UdpProfile::ReliableLAN();
     return p;
   }
@@ -3045,10 +3105,9 @@ class QuicConnection {
         if (it == ooo.end()) break;  // Gap – wait for missing fragment
 
         const auto &frag = it->second;
-        enum ssl_encryption_level_t current_level =
-            SSL_quic_read_level(crypto_ctx_->ssl);
-        int prov_ret = SSL_provide_quic_data(crypto_ctx_->ssl, current_level,
-                                             frag.data(), frag.size());
+        int prov_ret = SSL_provide_quic_data(
+            crypto_ctx_->ssl, static_cast<ssl_encryption_level_t>(ssl_level),
+            frag.data(), frag.size());
         if (prov_ret <= 0) {
           char err_buf[256];
           ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
@@ -3318,6 +3377,19 @@ class QuicConnection {
     return std::chrono::steady_clock::now() - last_activity_ > timeout;
   }
 
+  size_t GetCongestionWindow() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return congestion_controller_
+               ? congestion_controller_->GetCongestionWindow()
+               : 0;
+  }
+
+  size_t GetBytesInFlight() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return congestion_controller_ ? congestion_controller_->GetBytesInFlight()
+                                  : 0;
+  }
+
   /**
    * @brief Returns statistics for this connection.
    */
@@ -3445,6 +3517,21 @@ class QuicConnection {
     auto frames = std::move(pending_packets_.front());
     pending_packets_.pop_front();
     return frames;
+  }
+
+  bool PopPendingPacketIfSendable(size_t next_packet_size,
+                                  std::vector<QuicFrame> &out_frames) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (pending_packets_.empty()) {
+      return false;
+    }
+    if (congestion_controller_ &&
+        !congestion_controller_->CanSend(next_packet_size)) {
+      return false;
+    }
+    out_frames = std::move(pending_packets_.front());
+    pending_packets_.pop_front();
+    return true;
   }
 
   /**
@@ -3779,13 +3866,14 @@ inline void SetQuicTransportParams(SSL *ssl) {
 
   // 3. standard parameters
   const auto &p = conn->GetProfile();
-  write_param(params, 0x03, p.initial_max_data);
-  write_param(params, 0x04, p.initial_max_stream_data);
+  write_param(params, 0x03, p.max_datagram_size);
+  write_param(params, 0x04, p.initial_max_data);
   write_param(params, 0x05, p.initial_max_stream_data);
   write_param(params, 0x06, p.initial_max_stream_data);
-  write_param(params, 0x07, p.max_streams_bidi);
-  write_param(params, 0x08, p.max_streams_uni);
-  write_param(params, 0x09, p.ack_delay_exponent);
+  write_param(params, 0x07, p.initial_max_stream_data);
+  write_param(params, 0x08, p.max_streams_bidi);
+  write_param(params, 0x09, p.max_streams_uni);
+  write_param(params, 0x0a, p.ack_delay_exponent);
   write_param(params, 0x0e, p.active_connection_id_limit);
 
   SSL_set_quic_transport_params(ssl, params.data(), params.size());
@@ -3837,7 +3925,8 @@ class QuicServer {
    * @param bind_address The address to bind to (default: "0.0.0.0").
    */
   explicit QuicServer(uint16_t port,
-                      const std::string &bind_address = "0.0.0.0")
+                      const std::string &bind_address = "0.0.0.0",
+                      SelfSignedCertType cert_type = SelfSignedCertType::ECDSA)
       : listener_(port, bind_address) {
     ssl_ctx_ = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
@@ -3853,7 +3942,7 @@ class QuicServer {
     alpn_wire_ = internal::SerializeAlpnProtos(alpn_protos_);
     SSL_CTX_set_alpn_select_cb(ssl_ctx_, internal::QuicAlpnSelectCallback,
                                &alpn_wire_);
-    if (!internal::GenerateSelfSignedCert(ssl_ctx_)) {
+    if (!internal::GenerateSelfSignedCert(ssl_ctx_, cert_type)) {
       internal::Log(LogSeverity::Error, "QuicServer",
                     "Failed to generate self-signed certificate");
     }
@@ -4029,6 +4118,15 @@ class QuicServer {
    */
   cpppubsub::PubSub &GetEventBroker() { return event_broker_; }
 
+  std::vector<std::shared_ptr<QuicConnection>> GetConnections() const {
+    std::lock_guard<std::mutex> lock(connections_mtx_);
+    std::vector<std::shared_ptr<QuicConnection>> res;
+    for (const auto &[id, conn] : connections_) {
+      res.push_back(conn);
+    }
+    return res;
+  }
+
   /**
    * @brief Returns aggregate statistics across all connections.
    */
@@ -4061,8 +4159,9 @@ class QuicServer {
    */
   void SendPendingPackets(std::shared_ptr<QuicConnection> conn) {
     if (!conn) return;
-    while (conn->HasPendingPackets() && conn->CanSend(1200)) {
-      auto frames = conn->PopPendingPacket();
+    size_t burst_count = 0;
+    std::vector<QuicFrame> frames;
+    while (conn->PopPendingPacketIfSendable(1200, frames)) {
       uint8_t pkt_type = 0;
       auto pkt = conn->CreatePacket(std::move(frames), pkt_type);
       auto bytes = conn->SerializePacket(pkt);
@@ -4073,6 +4172,12 @@ class QuicServer {
         dest = conn->GetCandidatePeer();
       }
       listener_.Send(dest, bytes);
+      burst_count++;
+      const auto &profile = conn->GetProfile();
+      if (profile.pacing_burst_packets > 0 && profile.pacing_delay_us > 0 &&
+          burst_count % profile.pacing_burst_packets == 0) {
+        PreciseSleep(std::chrono::microseconds(profile.pacing_delay_us));
+      }
     }
   }
 
@@ -4459,20 +4564,26 @@ class QuicServer {
 
       if (conn->IsAutoFlowControlEnabled()) {
         if (!data.empty() || stream->IsFinished()) {
-          MaxStreamDataFrame max_stream;
-          max_stream.stream_id = frame.stream_id;
-          max_stream.max_stream_data = stream->GetMaxRecvOffset();
+          if (!data.empty()) {
+            conn->AddBytesRead(data.size());
+          }
+          if (stream->ShouldSendMaxStreamData() || stream->IsFinished()) {
+            stream->UpdateLastSentMaxRecvOffset();
+            MaxStreamDataFrame max_stream;
+            max_stream.stream_id = frame.stream_id;
+            max_stream.max_stream_data = stream->GetMaxRecvOffset();
 
-          MaxDataFrame max_data;
-          max_data.max_data = conn->GetMaxRecvData();
+            MaxDataFrame max_data;
+            max_data.max_data = conn->GetMaxRecvData();
 
-          std::vector<QuicFrame> frames;
-          frames.push_back(std::move(max_stream));
-          frames.push_back(std::move(max_data));
-          auto pkt = conn->CreatePacket(std::move(frames));
-          auto bytes = conn->SerializePacket(pkt);
-          conn->AddBytesSent(bytes.size());
-          listener_.Send(conn->GetPeer(), bytes);
+            std::vector<QuicFrame> frames;
+            frames.push_back(std::move(max_stream));
+            frames.push_back(std::move(max_data));
+            auto pkt = conn->CreatePacket(std::move(frames));
+            auto bytes = conn->SerializePacket(pkt);
+            conn->AddBytesSent(bytes.size());
+            listener_.Send(conn->GetPeer(), bytes);
+          }
         }
       }
     }
@@ -4480,7 +4591,7 @@ class QuicServer {
 
   void SendAck(std::shared_ptr<QuicConnection> conn, uint8_t packet_type,
                bool force = false) {
-    if (!force && packet_type == 3 &&
+    if (!force && packet_type == 0 &&
         conn->GetPendingAckCount(packet_type) < 2) {
       return;
     }
@@ -4548,14 +4659,21 @@ class QuicServer {
       }
 
       // Flush delayed ACKs
-      SendAck(conn, 3, true);
+      SendAck(conn, 0, true);
 
-      // Process retransmissions
+      // Process retransmissions with pacing
       auto retransmits = conn->GetRetransmissions();
+      size_t retransmit_burst = 0;
       for (auto &pkt : retransmits) {
         auto bytes = conn->SerializePacket(pkt);
         conn->AddBytesSent(bytes.size());
         listener_.Send(conn->GetPeer(), bytes);
+        retransmit_burst++;
+        const auto &profile = conn->GetProfile();
+        if (profile.pacing_burst_packets > 0 && profile.pacing_delay_us > 0 &&
+            retransmit_burst % profile.pacing_burst_packets == 0) {
+          PreciseSleep(std::chrono::microseconds(profile.pacing_delay_us));
+        }
       }
 
       // Drain any pending packets that were blocked by congestion control
@@ -4913,8 +5031,9 @@ class QuicClient {
 
   void SendPendingPackets() {
     if (!connection_) return;
-    while (connection_->HasPendingPackets() && connection_->CanSend(1200)) {
-      auto frames = connection_->PopPendingPacket();
+    size_t burst_count = 0;
+    std::vector<QuicFrame> frames;
+    while (connection_->PopPendingPacketIfSendable(1200, frames)) {
       uint8_t pkt_type = 0;
       auto pkt = connection_->CreatePacket(std::move(frames), pkt_type);
       auto bytes = connection_->SerializePacket(pkt);
@@ -4926,6 +5045,12 @@ class QuicClient {
         dest = connection_->GetCandidatePeer();
       }
       sender_.Send(dest, bytes);
+      burst_count++;
+      const auto &profile = connection_->GetProfile();
+      if (profile.pacing_burst_packets > 0 && profile.pacing_delay_us > 0 &&
+          burst_count % profile.pacing_burst_packets == 0) {
+        PreciseSleep(std::chrono::microseconds(profile.pacing_delay_us));
+      }
     }
   }
 
@@ -5156,21 +5281,24 @@ class QuicClient {
                       if (!data.empty()) {
                         connection_->AddBytesRead(data.size());
                       }
-                      MaxStreamDataFrame max_stream;
-                      max_stream.stream_id = f.stream_id;
-                      max_stream.max_stream_data = stream->GetMaxRecvOffset();
+                      if (stream->ShouldSendMaxStreamData() || is_finished) {
+                        stream->UpdateLastSentMaxRecvOffset();
+                        MaxStreamDataFrame max_stream;
+                        max_stream.stream_id = f.stream_id;
+                        max_stream.max_stream_data = stream->GetMaxRecvOffset();
 
-                      MaxDataFrame max_data;
-                      max_data.max_data = connection_->GetMaxRecvData();
+                        MaxDataFrame max_data;
+                        max_data.max_data = connection_->GetMaxRecvData();
 
-                      std::vector<QuicFrame> frames;
-                      frames.push_back(std::move(max_stream));
-                      frames.push_back(std::move(max_data));
-                      auto pkt_out =
-                          connection_->CreatePacket(std::move(frames));
-                      auto bytes = connection_->SerializePacket(pkt_out);
-                      connection_->AddBytesSent(bytes.size());
-                      sender_.Send(server_address_, bytes);
+                        std::vector<QuicFrame> frames;
+                        frames.push_back(std::move(max_stream));
+                        frames.push_back(std::move(max_data));
+                        auto pkt_out =
+                            connection_->CreatePacket(std::move(frames));
+                        auto bytes = connection_->SerializePacket(pkt_out);
+                        connection_->AddBytesSent(bytes.size());
+                        sender_.Send(server_address_, bytes);
+                      }
                     }
                   }
                 }
@@ -5181,6 +5309,9 @@ class QuicClient {
                 connection_->ProcessAck(f);
                 connection_->GenerateStreamPackets();
                 SendPendingPackets();
+                if (flow_control_handler_) {
+                  flow_control_handler_();
+                }
               }
             } else if constexpr (std::is_same_v<T, PingFrame>) {
               if (connection_) {
@@ -5281,7 +5412,7 @@ class QuicClient {
 
   void SendAck(uint8_t packet_type, bool force = false) {
     if (!connection_) return;
-    if (!force && packet_type == 3 &&
+    if (!force && packet_type == 0 &&
         connection_->GetPendingAckCount(packet_type) < 2) {
       return;
     }
@@ -5303,14 +5434,21 @@ class QuicClient {
     }
 
     // Flush delayed ACKs
-    SendAck(3, true);
+    SendAck(0, true);
 
     // Process retransmissions with pacing
     auto retransmits = connection_->GetRetransmissions();
+    size_t retransmit_burst = 0;
     for (auto &pkt : retransmits) {
       auto bytes = connection_->SerializePacket(pkt);
       connection_->AddBytesSent(bytes.size());
       sender_.Send(server_address_, bytes);
+      retransmit_burst++;
+      const auto &profile = connection_->GetProfile();
+      if (profile.pacing_burst_packets > 0 && profile.pacing_delay_us > 0 &&
+          retransmit_burst % profile.pacing_burst_packets == 0) {
+        PreciseSleep(std::chrono::microseconds(profile.pacing_delay_us));
+      }
     }
 
     // Drain any pending packets that were blocked by congestion control
