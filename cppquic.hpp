@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -42,7 +43,7 @@
 namespace cppquic {
 
 constexpr int VERSION_MAJOR = 1;
-constexpr int VERSION_MINOR = 11;
+constexpr int VERSION_MINOR = 12;
 constexpr int VERSION_PATCH = 0;
 
 /**
@@ -1116,7 +1117,12 @@ inline bool DeserializeFrame(const uint8_t *buf, size_t len, size_t &offset,
       f.offset = 0;
     }
     uint64_t data_len = 0;
-    if (!ReadVarInt(buf, len, offset, data_len)) return false;
+    if (frame_type_raw & 0x02) {
+      if (!ReadVarInt(buf, len, offset, data_len)) return false;
+    } else {
+      if (len < offset) return false;
+      data_len = len - offset;
+    }
     if (offset + data_len > len) return false;
     f.data.assign(buf + offset, buf + offset + data_len);
     offset += data_len;
@@ -1461,6 +1467,18 @@ struct QuicPacket {
   ConnectionId source_connection_id;
   uint64_t packet_number = 0;
   std::vector<QuicFrame> frames;
+
+  bool IsAckEliciting() const {
+    if (frames.empty()) return true;
+    for (const auto &frame : frames) {
+      if (!std::holds_alternative<AckFrame>(frame) &&
+          !std::holds_alternative<ConnectionCloseFrame>(frame) &&
+          !std::holds_alternative<PaddingFrame>(frame)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   /**
    * @brief Serializes this packet into a byte buffer.
@@ -1816,6 +1834,7 @@ struct QuicPacket {
               (out.packet_number >> (i * 8)) & 0xFF;
         }
         std::vector<uint8_t> aad(dec_buf, dec_buf + AAD_offset);
+
         if (!internal::DecryptData(*key, pkt_iv, payload_buf, plaintext, aad)) {
           internal::Log(LogSeverity::Warn, "QuicPacket",
                         "Decryption failed for short header packet");
@@ -2213,6 +2232,7 @@ struct QuicProfile {
   uint64_t max_streams_bidi = 100;
   uint64_t max_streams_uni = 100;
   uint64_t ack_delay_exponent = 3;
+  uint64_t ack_packet_tolerance = 2;
   uint64_t active_connection_id_limit = 2;
 
   size_t pacing_burst_packets = 8;
@@ -2232,6 +2252,7 @@ struct QuicProfile {
     p.max_streams_uni = 1000;
     p.pacing_burst_packets = 8;
     p.pacing_delay_us = 50;
+    p.ack_packet_tolerance = 10;
     p.udp_profile = cppudpnet::UdpProfile::HighThroughput();
     return p;
   }
@@ -2246,6 +2267,7 @@ struct QuicProfile {
     p.initial_max_stream_data = 64 * 1024 * 1024;
     p.pacing_burst_packets = 8;
     p.pacing_delay_us = 100;
+    p.ack_packet_tolerance = 4;
     p.udp_profile = cppudpnet::UdpProfile::HighLatency();
     return p;
   }
@@ -2262,6 +2284,7 @@ struct QuicProfile {
     p.max_streams_uni = 10;
     p.pacing_burst_packets = 4;
     p.pacing_delay_us = 150;
+    p.ack_packet_tolerance = 2;
     p.udp_profile = cppudpnet::UdpProfile::LowBandwidth();
     return p;
   }
@@ -2276,6 +2299,7 @@ struct QuicProfile {
     p.initial_max_stream_data = 16 * 1024 * 1024;
     p.pacing_burst_packets = 16;
     p.pacing_delay_us = 20;
+    p.ack_packet_tolerance = 10;
     p.udp_profile = cppudpnet::UdpProfile::ReliableLAN();
     return p;
   }
@@ -2670,7 +2694,6 @@ class QuicConnection {
   }
 
   void HandleKeylogLine(const std::string &line) {
-    internal::Log(LogSeverity::Info, "QuicConnection", "Keylog line: " + line);
     std::vector<std::string> parts;
     std::string current;
     for (char c : line) {
@@ -3062,8 +3085,18 @@ class QuicConnection {
       }
     }
     uint8_t expected_len = local_connection_id_.length;
-    return QuicPacket::Deserialize(data, out, read_key, read_iv, read_hp,
-                                   expected_len);
+    bool res = QuicPacket::Deserialize(data, out, read_key, read_iv, read_hp,
+                                       expected_len);
+    if (!res) {
+      internal::Log(
+          LogSeverity::Warn, "QuicServer",
+          "Deserialize failed. size=" + std::to_string(data.size()) +
+              " expected_len=" + std::to_string(expected_len) +
+              " key_size=" + std::to_string(read_key ? read_key->size() : 0) +
+              " hp_size=" + std::to_string(read_hp ? read_hp->size() : 0) +
+              " first_byte=" + std::to_string(data.empty() ? 0 : data[0]));
+    }
+    return res;
   }
 
   bool DeserializePacket(const std::vector<uint8_t> &data, QuicPacket &out) {
@@ -3236,19 +3269,25 @@ class QuicConnection {
   /**
    * @brief Records that a packet was received (for ACK generation).
    */
-  void RecordReceivedPacket(uint64_t packet_number, uint8_t packet_type) {
+  void RecordReceivedPacket(uint64_t packet_number, uint8_t packet_type,
+                            bool is_ack_eliciting = true) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (packet_type > 3) return;
-    received_packets_[packet_type].push_back(packet_number);
-    if (packet_number > largest_received_packet_[packet_type]) {
+    received_packets_[packet_type].insert(packet_number);
+    if (packet_number >= largest_received_packet_[packet_type]) {
       largest_received_packet_[packet_type] = packet_number;
+      largest_received_packet_time_[packet_type] =
+          std::chrono::steady_clock::now();
+    }
+    if (is_ack_eliciting) {
+      pending_ack_eliciting_count_[packet_type]++;
     }
   }
 
   size_t GetPendingAckCount(uint8_t packet_type) const {
     std::lock_guard<std::mutex> lock(mtx_);
     if (packet_type > 3) return 0;
-    return received_packets_[packet_type].size();
+    return pending_ack_eliciting_count_[packet_type];
   }
 
   /**
@@ -3257,10 +3296,25 @@ class QuicConnection {
   AckFrame GenerateAckLocked(uint8_t packet_type) {
     AckFrame ack;
     if (packet_type > 3) return ack;
+
+    // RFC 9000: A receiver MUST NOT send an ACK frame in response to a packet
+    // that is not ack-eliciting.
+    if (pending_ack_eliciting_count_[packet_type] == 0) {
+      return ack;
+    }
+
     ack.largest_acknowledged = largest_received_packet_[packet_type];
-    ack.ack_delay_us = 0;
-    ack.acknowledged_packets = received_packets_[packet_type];
+
+    // Calculate ack_delay_us
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - largest_received_packet_time_[packet_type]);
+    ack.ack_delay_us = elapsed.count();
+
+    ack.acknowledged_packets.assign(received_packets_[packet_type].begin(),
+                                    received_packets_[packet_type].end());
     received_packets_[packet_type].clear();
+    pending_ack_eliciting_count_[packet_type] = 0;
     return ack;
   }
 
@@ -3678,8 +3732,12 @@ class QuicConnection {
   double rtt_var_ms_ = 50.0;
 
   // Received packet tracking for ACK generation per packet number space
-  std::vector<uint64_t> received_packets_[4];
+  std::set<uint64_t> received_packets_[4];
   uint64_t largest_received_packet_[4] = {0, 0, 0, 0};
+  std::chrono::steady_clock::time_point largest_received_packet_time_[4] = {
+      std::chrono::steady_clock::now(), std::chrono::steady_clock::now(),
+      std::chrono::steady_clock::now(), std::chrono::steady_clock::now()};
+  uint64_t pending_ack_eliciting_count_[4] = {0, 0, 0, 0};
 
   // Short-header (1-RTT) packets that arrived before handshake_complete.
   // Replayed immediately after 1-RTT keys are available.
@@ -3712,12 +3770,35 @@ class QuicConnection {
 
 namespace internal {
 
+inline void GetCipherKeyLengths(const SSL_CIPHER *cipher, size_t secret_len,
+                                size_t &key_len, size_t &hp_len) {
+  if (cipher) {
+    const char *name_ptr = SSL_CIPHER_get_name(cipher);
+    std::string name = name_ptr ? name_ptr : "";
+    if (name == "TLS_AES_256_GCM_SHA384") {
+      key_len = 32;
+      hp_len = 32;
+      return;
+    } else if (name == "TLS_CHACHA20_POLY1305_SHA256") {
+      key_len = 32;
+      hp_len = 16;
+      return;
+    } else if (name == "TLS_AES_128_GCM_SHA256") {
+      key_len = 16;
+      hp_len = 16;
+      return;
+    }
+  }
+  // Fallback to secret_len check if cipher is not available or unrecognized
+  key_len = (secret_len == 48) ? 32 : 16;
+  hp_len = (secret_len == 48) ? 32 : 16;
+}
+
 inline void DeriveQuicKeys(const uint8_t *secret, size_t secret_len,
+                           size_t key_len, size_t hp_len,
                            std::vector<uint8_t> &key, std::vector<uint8_t> &iv,
                            std::vector<uint8_t> &hp) {
   std::vector<uint8_t> secret_vec(secret, secret + secret_len);
-  size_t key_len = (secret_len == 48) ? 32 : 16;
-  size_t hp_len = (secret_len == 48) ? 32 : 16;
   key = HKDF_Expand_Label_QUIC(secret_vec, "key", {}, key_len);
   iv = HKDF_Expand_Label_QUIC(secret_vec, "iv", {}, 12);
   hp = HKDF_Expand_Label_QUIC(secret_vec, "hp", {}, hp_len);
@@ -3732,8 +3813,11 @@ inline int quic_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
   auto crypto_ctx = conn->GetCryptoContext();
   if (!crypto_ctx) return 0;
 
+  size_t key_len = 16, hp_len = 16;
+  internal::GetCipherKeyLengths(cipher, secret_len, key_len, hp_len);
+
   std::vector<uint8_t> key, iv, hp;
-  DeriveQuicKeys(secret, secret_len, key, iv, hp);
+  internal::DeriveQuicKeys(secret, secret_len, key_len, hp_len, key, iv, hp);
 
   if (level == ssl_encryption_handshake) {
     crypto_ctx->handshake_read_key = key;
@@ -3756,8 +3840,11 @@ inline int quic_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level,
   auto crypto_ctx = conn->GetCryptoContext();
   if (!crypto_ctx) return 0;
 
+  size_t key_len = 16, hp_len = 16;
+  internal::GetCipherKeyLengths(cipher, secret_len, key_len, hp_len);
+
   std::vector<uint8_t> key, iv, hp;
-  DeriveQuicKeys(secret, secret_len, key, iv, hp);
+  internal::DeriveQuicKeys(secret, secret_len, key_len, hp_len, key, iv, hp);
 
   if (level == ssl_encryption_handshake) {
     crypto_ctx->handshake_write_key = key;
@@ -4302,7 +4389,8 @@ class QuicServer {
         }
         return;
       }
-      conn->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
+      conn->RecordReceivedPacket(pkt.packet_number, pkt.packet_type,
+                                 pkt.IsAckEliciting());
       packet_recorded = true;
     } else {
       bool is_initial = false;
@@ -4395,8 +4483,8 @@ class QuicServer {
                 conn = HandleClientHello(peer, conn_id,
                                          pkt.source_connection_id, f);
                 if (conn && !packet_recorded) {
-                  conn->RecordReceivedPacket(pkt.packet_number,
-                                             pkt.packet_type);
+                  conn->RecordReceivedPacket(pkt.packet_number, pkt.packet_type,
+                                             pkt.IsAckEliciting());
                   packet_recorded = true;
                 }
               }
@@ -4503,7 +4591,7 @@ class QuicServer {
           },
           frame);
     }
-    if (conn) SendAck(conn, pkt.packet_type);
+    if (conn && pkt.IsAckEliciting()) SendAck(conn, pkt.packet_type);
   }
 
   std::shared_ptr<QuicConnection> HandleClientHello(
@@ -4592,7 +4680,8 @@ class QuicServer {
   void SendAck(std::shared_ptr<QuicConnection> conn, uint8_t packet_type,
                bool force = false) {
     if (!force && packet_type == 0 &&
-        conn->GetPendingAckCount(packet_type) < 2) {
+        conn->GetPendingAckCount(packet_type) <
+            conn->GetProfile().ack_packet_tolerance) {
       return;
     }
     auto ack = conn->GenerateAck(packet_type);
@@ -5182,7 +5271,8 @@ class QuicClient {
                       "Failed to deserialize packet from server");
         return;
       }
-      connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
+      connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type,
+                                        pkt.IsAckEliciting());
     } else {
       // Derive Initial keys to decrypt Server Initial packet
       std::vector<uint8_t> temp_read_key;
@@ -5202,7 +5292,8 @@ class QuicClient {
         return;
       }
       if (connection_) {
-        connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type);
+        connection_->RecordReceivedPacket(pkt.packet_number, pkt.packet_type,
+                                          pkt.IsAckEliciting());
       }
     }
 
@@ -5408,12 +5499,16 @@ class QuicClient {
           },
           frame);
     }
+    if (connection_ && pkt.IsAckEliciting()) {
+      SendAck(pkt.packet_type);
+    }
   }
 
   void SendAck(uint8_t packet_type, bool force = false) {
     if (!connection_) return;
     if (!force && packet_type == 0 &&
-        connection_->GetPendingAckCount(packet_type) < 2) {
+        connection_->GetPendingAckCount(packet_type) <
+            connection_->GetProfile().ack_packet_tolerance) {
       return;
     }
     auto ack = connection_->GenerateAck(packet_type);

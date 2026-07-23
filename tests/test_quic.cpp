@@ -783,6 +783,55 @@ TEST(QuicConnectionTest, RecordAndGenerateAck) {
   EXPECT_TRUE(ack2.acknowledged_packets.empty());
 }
 
+TEST(QuicConnectionTest, AckImprovementsTest) {
+  auto local_id = cppquic::internal::GenerateConnectionId();
+  auto remote_id = cppquic::internal::GenerateConnectionId();
+  cppudpnet::PeerAddress peer{"127.0.0.1", 4433};
+
+  cppquic::QuicConnection conn(local_id, remote_id, peer, false);
+
+  // 1. Verify deduplication and sorting
+  conn.RecordReceivedPacket(10, 0, true);
+  conn.RecordReceivedPacket(8, 0, true);
+  conn.RecordReceivedPacket(9, 0, true);
+  conn.RecordReceivedPacket(10, 0, true);  // duplicate
+
+  // 2. Verify ACK delay calculation
+  // Sleep briefly to ensure elapsed time > 0
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  auto ack = conn.GenerateAck(0);
+  EXPECT_EQ(ack.largest_acknowledged, 10u);
+  // Should be exactly 3 unique packets: {8, 9, 10}
+  EXPECT_EQ(ack.acknowledged_packets.size(), 3u);
+  EXPECT_EQ(ack.acknowledged_packets[0], 8u);
+  EXPECT_EQ(ack.acknowledged_packets[1], 9u);
+  EXPECT_EQ(ack.acknowledged_packets[2], 10u);
+  EXPECT_GT(ack.ack_delay_us, 0u);
+
+  // 3. Verify ACK-eliciting logic
+  // Non-ack-eliciting packet arrives
+  conn.RecordReceivedPacket(11, 0, false);
+  EXPECT_EQ(conn.GetPendingAckCount(0),
+            0u);  // Should not increase pending count
+
+  // GenerateAck should return empty because no ack-eliciting packet was
+  // received
+  auto ack_empty = conn.GenerateAck(0);
+  EXPECT_TRUE(ack_empty.acknowledged_packets.empty());
+
+  // Now an ack-eliciting packet arrives
+  conn.RecordReceivedPacket(12, 0, true);
+  EXPECT_EQ(conn.GetPendingAckCount(0), 1u);
+
+  // GenerateAck should now return an ACK that includes both packets 11 and 12
+  auto ack_combined = conn.GenerateAck(0);
+  EXPECT_EQ(ack_combined.largest_acknowledged, 12u);
+  EXPECT_EQ(ack_combined.acknowledged_packets.size(), 2u);
+  EXPECT_EQ(ack_combined.acknowledged_packets[0], 11u);
+  EXPECT_EQ(ack_combined.acknowledged_packets[1], 12u);
+}
+
 TEST(QuicConnectionTest, HandshakePacket) {
   auto local_id = cppquic::internal::GenerateConnectionId();
   auto remote_id = cppquic::internal::GenerateConnectionId();
